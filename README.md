@@ -64,6 +64,13 @@ If you want to run or modify the source code directly.
 
     # Example: by single commit
     python git_archive_by_date.py "C:\path\to\your\repo" -o my_archive --commit-sha <your_sha>
+
+    # Example: by multi sha
+    python git_archive_by_date.py "C:\path\to\your\repo" -o my_archive --start-sha <your_start_sha> --end-sha <your_end_sha>
+
+    # Example: by date    
+    python git_archive_by_date.py "C:\path\to\your\repo" -o my_archive --branch <branch_name> --start-date <start_date> --end-date <end_date>
+    
     ```
 
 ### Building the Executable from Source
