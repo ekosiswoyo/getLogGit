@@ -6,7 +6,6 @@ A user-friendly tool, available in both GUI and CLI versions, to archive files f
 This tool creates a `.zip` file containing the specified files and a `.txt` changelog detailing the contents.
 
 ![Screenshot of the GUI application](placeholder.png)
-*Note: Please replace placeholder.png with a real screenshot of the application.*
 
 ## Features
 
@@ -25,7 +24,7 @@ This tool creates a `.zip` file containing the specified files and a `.txt` chan
 
 ## How to Use (for End-Users)
 
-1.  Go to the [**Releases**](https://github.com/ekosiswoyo/your-repo-name/releases) page of this repository.
+1.  Go to the [**Releases**](https://github.com/ekosiswoyo/getLogGit/releases) page of this repository.
 2.  Download the latest `.exe` file (`git_archive_ui.exe` for the graphical version is recommended).
 3.  Double-click `git_archive_ui.exe` to run the application.
 4.  Follow the on-screen instructions:
@@ -49,7 +48,7 @@ If you want to run or modify the source code directly.
 
 1.  **Clone the repository:**
     ```bash
-    git clone https://github.com/ekosiswoyo/your-repo-name.git
+    git clone https://github.com/ekosiswoyo/getLogGit.git
     cd your-repo-name
     ```
 
