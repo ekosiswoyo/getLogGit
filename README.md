@@ -11,6 +11,7 @@ This tool creates a `.zip` file containing the specified files and a `.txt` chan
 
 - **Graphical User Interface (GUI):** An easy-to-use interface for non-technical users.
 - **Command-Line Interface (CLI):** A powerful and scriptable interface for developers.
+- **Cross-Platform:** Runs on Windows, macOS, and Linux from the source code.
 - **Multiple Selection Modes:**
   - **Date Range:** Archive all changes on a specific branch within a start and end date.
   - **SHA Range:** Archive all changes between two specific commit SHAs.
@@ -18,7 +19,7 @@ This tool creates a `.zip` file containing the specified files and a `.txt` chan
 - **Dual Output:**
   - Creates a `.zip` archive with the full directory structure preserved.
   - Creates a `.txt` changelog file listing all included files and the range criteria.
-- **Portable Executable:** Packaged as a standalone `.exe` that runs on Windows without needing Python installed.
+- **Portable Executable:** Can be packaged into a standalone executable for easy distribution.
 
 ---
 
@@ -63,36 +64,43 @@ If you want to run or modify the source code directly.
     python git_archive_by_date.py --help
 
     # Example: by single commit
-    python git_archive_by_date.py "C:\path\to\your\repo" -o my_archive --commit-sha <your_sha>
+    python git_archive_by_date.py "C:\path\to\your\repo" -o my_archive --commit-sha <commit_hash>
 
-    # Example: by multi sha
-    python git_archive_by_date.py "C:\path\to\your\repo" -o my_archive --start-sha <your_start_sha> --end-sha <your_end_sha>
+    # Example: by SHA range
+    python git_archive_by_date.py "C:\path\to\your\repo" -o my_archive --start-sha <starting_commit_hash> --end-sha <ending_commit_hash>
 
-    # Example: by date    
-    python git_archive_by_date.py "C:\path\to\your\repo" -o my_archive --branch <branch_name> --start-date <start_date> --end-date <end_date>
+    # Example: by date range
+    python git_archive_by_date.py "C:\path\to\your\repo" -o my_archive --branch main --start-date YYYY-MM-DD --end-date YYYY-MM-DD
     
     ```
 
-### Building the Executable from Source
 
-To create the `.exe` files yourself:
+### Building Your Own Executable
 
-1.  **Install PyInstaller:**
+To create the executable file yourself:
+
+1.  **Install dependencies:**
     ```bash
     pip install pyinstaller
     ```
 
-2.  **Build the GUI executable:**
-    ```bash
-    pyinstaller --onefile --windowed git_archive_ui.py
-    ```
+2.  **Build the executable:**
+    *   For Windows (`.exe`):
+        ```bash
+        # GUI App
+        pyinstaller --onefile --windowed git_archive_ui.py
+        # CLI App
+        pyinstaller --onefile git_archive_by_date.py
+        ```
+    *   For macOS (`.app`):
+        ```bash
+        # GUI App
+        pyinstaller --onefile --windowed git_archive_ui.py
+        # CLI App
+        pyinstaller --onefile git_archive_by_date.py
+        ```
 
-3.  **Build the CLI executable:**
-    ```bash
-    pyinstaller --onefile git_archive_by_date.py
-    ```
-
-4.  The final `.exe` files will be located in the `dist/` folder.
+3.  The final executable will be located in the `dist/` folder.
 
 ---
 
