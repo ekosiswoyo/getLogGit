@@ -1,0 +1,48 @@
+Changelog for archive.zip
+======================================================================
+Repository: D:\Path\To\Your\Repository
+Branch: pooling_r8
+Date Range: 2025-07-01 to 2025-07-31
+Total Files Archived: 5
+======================================================================
+
+Commits with Changed Files (3):
+======================================================================
+
+[1] Commit: 87553c7567 [MERGE]
+    Author: eko <eko@sgo.co.id>
+    Date: 2025-07-23 07:17:43 +0000
+    Message: Merge branch 'revert-6e1c7fef' into 'pooling_r8'
+    Type: Merge Commit
+    Note: Merge commits may not show direct file changes
+    Files Changed (5):
+      - .env
+      - config/app.php
+      - resources/views/layout.blade.php
+      - src/services/ApiService.php
+      - tests/unit/ApiTest.php
+------------------------------------------------------------
+
+[2] Commit: 6e1c7fef12
+    Author: jane <jane@sgo.co.id>
+    Date: 2025-07-22 15:30:20 +0000
+    Message: Add API configuration and update layout
+    Files Changed (3):
+      - config/app.php
+      - resources/views/layout.blade.php
+      - src/services/ApiService.php
+------------------------------------------------------------
+
+[3] Commit: d844c6bf34
+    Author: bob <bob@sgo.co.id>
+    Date: 2025-07-21 10:45:10 +0000
+    Message: Add environment configuration
+    Files Changed (2):
+      - .env
+      - tests/unit/ApiTest.php
+------------------------------------------------------------
+
+Summary:
+- Total commits: 3
+- Total unique files archived: 5
+- Total file changes across all commits: 10
