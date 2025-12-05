@@ -5,6 +5,7 @@ import argparse
 import subprocess
 import shutil
 import tempfile
+import json
 from datetime import datetime
 
 # This script can be run as a standalone CLI or imported by another script (like a UI).
@@ -142,21 +143,89 @@ def get_commits_with_files(repo_path, mode, **kwargs):
     
     return commits
 
+def get_file_list_preview(params):
+    """
+    Get list of files that would be archived without actually creating the archive.
+    Returns a dictionary with file list and metadata.
+    """
+    repo_path = params['repo_path']
+    mode = params['mode']
+    
+    if not os.path.isdir(repo_path) or not os.path.isdir(os.path.join(repo_path, '.git')):
+        return {'error': f"Not a valid git repository: '{repo_path}'"}
+    
+    files_output = None
+    latest_commit_hash = None
+    commits_info = []
+    
+    try:
+        if mode == 'date':
+            start_date, end_date, branch = params['start_date'], params['end_date'], params['branch']
+            latest_commit_cmd = ['git', 'rev-list', '-1', f'--before="{end_date} 23:59:59"', branch]
+            latest_commit_hash = run_command(latest_commit_cmd, repo_path)
+            if not latest_commit_hash:
+                return {'error': f"Could not find a commit on branch '{branch}' before '{end_date}'."}
+            log_cmd = ['git', 'log', branch, f'--since="{start_date} 00:00:00"', f'--until="{end_date} 23:59:59"', '--name-only', '--pretty=format:']
+            files_output = run_command(log_cmd, repo_path)
+            commits_info = get_commits_with_files(repo_path, 'date', branch=branch, start_date=start_date, end_date=end_date)
+            
+        elif mode == 'sha_range':
+            start_sha, end_sha = params['start_sha'], params['end_sha']
+            latest_commit_hash = end_sha
+            diff_cmd = ['git', 'diff', '--name-only', f'{start_sha}..{end_sha}']
+            files_output = run_command(diff_cmd, repo_path)
+            commits_info = get_commits_with_files(repo_path, 'sha_range', start_sha=start_sha, end_sha=end_sha)
+            
+        elif mode == 'commit_sha':
+            commit_sha = params['commit_sha']
+            latest_commit_hash = commit_sha
+            show_cmd = ['git', 'show', '--name-only', '--pretty=format:', commit_sha]
+            files_output = run_command(show_cmd, repo_path)
+            commits_info = get_commits_with_files(repo_path, 'commit_sha', commit_sha=commit_sha)
+        
+        if files_output is None:
+            return {'error': "Failed to get file list from git. Check your parameters and that git is installed."}
+        
+        # Split lines and filter out empty strings
+        all_files = files_output.splitlines()
+        changed_files = sorted(list(set([f.strip() for f in all_files if f.strip()])))
+        
+        return {
+            'files': changed_files,
+            'total_files': len(changed_files),
+            'commit_hash': latest_commit_hash,
+            'commits_info': commits_info,
+            'error': None
+        }
+    except Exception as e:
+        return {'error': str(e)}
+
 def archive_git_history(params):
     """
     Main logic for archiving files from a git repository.
     Accepts a dictionary of parameters and a log_callback function.
     """
     log_callback = params.get('log_callback', print) # Default to print for CLI mode
+    progress_callback = params.get('progress_callback', None) # Progress callback
+    cancel_event = params.get('cancel_event', None) # Threading.Event for cancellation
     repo_path = params['repo_path']
     output_zip = params['output_zip']
     mode = params['mode']
+    archive_format = params.get('archive_format', 'zip')  # Default to zip
+
+    def check_cancel():
+        """Check if cancellation was requested"""
+        if cancel_event and cancel_event.is_set():
+            raise InterruptedError("Process cancelled by user")
 
     try:
         if not os.path.isdir(repo_path) or not os.path.isdir(os.path.join(repo_path, '.git')):
             log_callback(f"Error: Not a valid git repository: '{repo_path}'")
             return
 
+        check_cancel()
+        if progress_callback:
+            progress_callback(5, "Validating repository...")
         log_callback(f"Processing repository: {os.path.abspath(repo_path)}")
 
         files_output = None
@@ -165,6 +234,9 @@ def archive_git_history(params):
         commits_info = []
 
         if mode == 'date':
+            check_cancel()
+            if progress_callback:
+                progress_callback(10, "Getting commits from date range...")
             start_date, end_date, branch = params['start_date'], params['end_date'], params['branch']
             range_display = f"{start_date} to {end_date}"
             changelog_range_info = f"Branch: {branch}\nDate Range: {range_display}"
@@ -176,10 +248,14 @@ def archive_git_history(params):
                 return
             log_cmd = ['git', 'log', branch, f'--since="{start_date} 00:00:00"', f'--until="{end_date} 23:59:59"', '--name-only', '--pretty=format:']
             files_output = run_command(log_cmd, repo_path)
+            check_cancel()
             # Get commit details with files for date range
             commits_info = get_commits_with_files(repo_path, 'date', branch=branch, start_date=start_date, end_date=end_date)
 
         elif mode == 'sha_range':
+            check_cancel()
+            if progress_callback:
+                progress_callback(10, "Getting commits from SHA range...")
             start_sha, end_sha = params['start_sha'], params['end_sha']
             range_display = f"{start_sha[:7]}..{end_sha[:7]}"
             changelog_range_info = f"SHA Range: {range_display}"
@@ -187,10 +263,14 @@ def archive_git_history(params):
             latest_commit_hash = end_sha
             diff_cmd = ['git', 'diff', '--name-only', f'{start_sha}..{end_sha}']
             files_output = run_command(diff_cmd, repo_path)
+            check_cancel()
             # Get commit details with files for SHA range
             commits_info = get_commits_with_files(repo_path, 'sha_range', start_sha=start_sha, end_sha=end_sha)
 
         elif mode == 'commit_sha':
+            check_cancel()
+            if progress_callback:
+                progress_callback(10, "Getting commit details...")
             commit_sha = params['commit_sha']
             range_display = f"Single Commit: {commit_sha[:7]}"
             changelog_range_info = f"Commit: {commit_sha}"
@@ -198,6 +278,7 @@ def archive_git_history(params):
             latest_commit_hash = commit_sha
             show_cmd = ['git', 'show', '--name-only', '--pretty=format:', commit_sha]
             files_output = run_command(show_cmd, repo_path)
+            check_cancel()
             # Get commit details with files for single commit
             commits_info = get_commits_with_files(repo_path, 'commit_sha', commit_sha=commit_sha)
 
@@ -205,7 +286,10 @@ def archive_git_history(params):
             log_callback("Error: Failed to get file list from git. Check your parameters and that git is installed.")
             return
 
-        changed_files = sorted(list(set(files_output.splitlines())))
+        check_cancel()
+        # Split lines and filter out empty strings
+        all_files = files_output.splitlines()
+        changed_files = sorted(list(set([f.strip() for f in all_files if f.strip()])))
         if not changed_files:
             log_callback("No files changed in the specified range or commit.")
             return
@@ -213,11 +297,19 @@ def archive_git_history(params):
         log_callback(f"Found {len(changed_files)} unique files.")
         log_callback(f"Using state of files from commit: {latest_commit_hash[:10]}")
 
+        check_cancel()
+        if progress_callback:
+            progress_callback(20, "Creating temporary directory...")
         temp_dir = tempfile.mkdtemp(prefix="git-archive-")
         log_callback(f"Created temporary directory: {temp_dir}")
 
         archived_files = []
-        for file_path in changed_files:
+        total_files = len(changed_files)
+        for idx, file_path in enumerate(changed_files):
+            check_cancel()
+            if progress_callback:
+                progress = 20 + int((idx / total_files) * 50)  # 20-70% for file archiving
+                progress_callback(progress, f"Archiving file {idx+1}/{total_files}: {file_path[:50]}...")
             if not file_path:
                 continue
             dest_path = os.path.join(temp_dir, file_path)
@@ -235,20 +327,38 @@ def archive_git_history(params):
             except subprocess.CalledProcessError:
                 log_callback(f"Warning: Could not find '{file_path}' in commit {latest_commit_hash[:10]}. Skipping.")
         
+        check_cancel()
         if not archived_files:
             log_callback("No files could be archived. Aborting.")
             shutil.rmtree(temp_dir)
             return
 
-        archive_name_base = os.path.splitext(output_zip)[0]
-        log_callback(f"Creating zip file: {archive_name_base}.zip")
-        shutil.make_archive(archive_name_base, 'zip', temp_dir)
-        log_callback("Successfully created zip archive.")
+        if progress_callback:
+            format_name = {'zip': 'ZIP', 'tar': 'TAR', 'gztar': 'TAR.GZ'}.get(archive_format, 'ZIP')
+            progress_callback(70, f"Creating {format_name} archive...")
+        
+        # Remove extension from output_zip if present, we'll add the correct one
+        archive_name_base = output_zip
+        for ext in ['.zip', '.tar', '.tar.gz', '.gz']:
+            if archive_name_base.lower().endswith(ext):
+                archive_name_base = archive_name_base[:-len(ext)]
+                break
+        
+        # Map format to extension for changelog
+        format_ext_map = {'zip': '.zip', 'tar': '.tar', 'gztar': '.tar.gz'}
+        archive_ext = format_ext_map.get(archive_format, '.zip')
+        
+        log_callback(f"Creating {archive_format.upper()} archive: {archive_name_base}{archive_ext}")
+        shutil.make_archive(archive_name_base, archive_format, temp_dir)
+        log_callback(f"Successfully created {archive_format.upper()} archive.")
 
+        check_cancel()
+        if progress_callback:
+            progress_callback(85, "Creating changelog file...")
         changelog_path = f"{archive_name_base}.txt"
         log_callback(f"Creating changelog file: {changelog_path}")
         with open(changelog_path, 'w', encoding='utf-8') as f:
-            f.write(f"Changelog for {os.path.basename(archive_name_base)}.zip\n")
+            f.write(f"Changelog for {os.path.basename(archive_name_base)}{archive_ext}\n")
             f.write("="*70 + "\n")
             f.write(f"Repository: {os.path.abspath(repo_path)}\n")
             f.write(changelog_range_info + "\n")
@@ -299,11 +409,20 @@ def archive_git_history(params):
                 f.write("-" * 50 + "\n")
                 for file_path in sorted(archived_files):
                     f.write(f"{file_path}\n")
+        if progress_callback:
+            progress_callback(100, "Process complete!")
         log_callback("Successfully created changelog file.")
         log_callback("\n--- PROCESS COMPLETE ---")
 
+    except InterruptedError as e:
+        log_callback(f"\n--- PROCESS CANCELLED ---")
+        log_callback(str(e))
+        if progress_callback:
+            progress_callback(0, "Cancelled")
     except Exception as e:
         log_callback(f"\nAn unexpected error occurred: {e}")
+        if progress_callback:
+            progress_callback(0, "Error occurred")
     finally:
         if 'temp_dir' in locals() and os.path.exists(temp_dir):
             log_callback(f"Cleaning up temporary directory: {temp_dir}")
