@@ -61,8 +61,11 @@ def get_commits_in_range(repo_path, mode, **kwargs):
         branch = kwargs.get('branch')
         start_date = kwargs.get('start_date')
         end_date = kwargs.get('end_date')
+        author = kwargs.get('author')
         log_cmd = ['git', 'log', branch, f'--since="{start_date} 00:00:00"', f'--until="{end_date} 23:59:59"', 
                    '--pretty=format:%H|%an|%ae|%ad|%s', '--date=iso']
+        if author:
+            log_cmd.append(f'--author={author}')
     elif mode == 'sha_range':
         start_sha = kwargs.get('start_sha')
         end_sha = kwargs.get('end_sha')
@@ -87,6 +90,35 @@ def get_commits_in_range(repo_path, mode, **kwargs):
                 })
     
     return commits
+
+def get_recent_commits(repo_path, limit=100, branch=None):
+    """Get a list of recent commits for browsing/picking.
+
+    Returns a list of dicts with hash, short_hash, author, date, message.
+    """
+    if not os.path.isdir(repo_path) or not os.path.isdir(os.path.join(repo_path, '.git')):
+        return {'error': f"Not a valid git repository: '{repo_path}'", 'commits': []}
+
+    log_cmd = ['git', 'log', f'-{limit}', '--pretty=format:%H|%an|%ad|%s', '--date=short']
+    if branch:
+        log_cmd.append(branch)
+    output = run_command(log_cmd, repo_path)
+    if output is None:
+        return {'error': "Failed to read git log. Check the repository and branch.", 'commits': []}
+
+    commits = []
+    for line in output.splitlines():
+        parts = line.split('|', 3)
+        if len(parts) == 4:
+            commits.append({
+                'hash': parts[0],
+                'short_hash': parts[0][:10],
+                'author': parts[1],
+                'date': parts[2],
+                'message': parts[3],
+            })
+    return {'error': None, 'commits': commits}
+
 
 def get_files_changed_in_commit(repo_path, commit_hash):
     """Get list of files changed in a specific commit."""
@@ -161,13 +193,16 @@ def get_file_list_preview(params):
     try:
         if mode == 'date':
             start_date, end_date, branch = params['start_date'], params['end_date'], params['branch']
+            author = params.get('author')
             latest_commit_cmd = ['git', 'rev-list', '-1', f'--before="{end_date} 23:59:59"', branch]
             latest_commit_hash = run_command(latest_commit_cmd, repo_path)
             if not latest_commit_hash:
                 return {'error': f"Could not find a commit on branch '{branch}' before '{end_date}'."}
             log_cmd = ['git', 'log', branch, f'--since="{start_date} 00:00:00"', f'--until="{end_date} 23:59:59"', '--name-only', '--pretty=format:']
+            if author:
+                log_cmd.append(f'--author={author}')
             files_output = run_command(log_cmd, repo_path)
-            commits_info = get_commits_with_files(repo_path, 'date', branch=branch, start_date=start_date, end_date=end_date)
+            commits_info = get_commits_with_files(repo_path, 'date', branch=branch, start_date=start_date, end_date=end_date, author=author)
             
         elif mode == 'sha_range':
             start_sha, end_sha = params['start_sha'], params['end_sha']
@@ -199,6 +234,101 @@ def get_file_list_preview(params):
         }
     except Exception as e:
         return {'error': str(e)}
+
+def _write_text_changelog(changelog_path, archive_name_base, archive_ext, repo_path,
+                          changelog_range_info, archived_files, commits_info):
+    """Write the classic plain-text changelog."""
+    with open(changelog_path, 'w', encoding='utf-8') as f:
+        f.write(f"Changelog for {os.path.basename(archive_name_base)}{archive_ext}\n")
+        f.write("=" * 70 + "\n")
+        f.write(f"Repository: {os.path.abspath(repo_path)}\n")
+        f.write(changelog_range_info + "\n")
+        f.write(f"Total Files Archived: {len(archived_files)}\n")
+        f.write("=" * 70 + "\n\n")
+
+        if commits_info:
+            f.write(f"Commits with Changed Files ({len(commits_info)}):\n")
+            f.write("=" * 70 + "\n")
+
+            total_commit_files = 0
+            for i, commit in enumerate(commits_info, 1):
+                commit_archived_files = [c for c in commit.get('files', []) if c in archived_files]
+                total_commit_files += len(commit_archived_files)
+
+                commit_type = " [MERGE]" if commit.get('is_merge', False) else ""
+                f.write(f"\n[{i}] Commit: {commit['hash'][:10]}{commit_type}\n")
+                f.write(f"    Author: {commit['author_name']} <{commit['author_email']}>\n")
+                f.write(f"    Date: {commit['date']}\n")
+                f.write(f"    Message: {commit['message']}\n")
+
+                if commit.get('is_merge', False):
+                    f.write(f"    Type: Merge Commit\n")
+                    if not commit_archived_files:
+                        f.write(f"    Note: Merge commits may not show direct file changes\n")
+
+                f.write(f"    Files Changed ({len(commit_archived_files)}):\n")
+                if commit_archived_files:
+                    for file_path in sorted(commit_archived_files):
+                        f.write(f"      - {file_path}\n")
+                else:
+                    if commit.get('is_merge', False):
+                        f.write(f"      (Merge commit - files may have been changed in merged branches)\n")
+                    else:
+                        f.write(f"      (No files from this commit were archived)\n")
+                f.write("-" * 60 + "\n")
+
+            f.write(f"\nSummary:\n")
+            f.write(f"- Total commits: {len(commits_info)}\n")
+            f.write(f"- Total unique files archived: {len(archived_files)}\n")
+            f.write(f"- Total file changes across all commits: {total_commit_files}\n")
+        else:
+            f.write(f"Archived Files ({len(archived_files)}):\n")
+            f.write("-" * 50 + "\n")
+            for file_path in sorted(archived_files):
+                f.write(f"{file_path}\n")
+
+
+def _write_markdown_changelog(changelog_path, archive_name_base, archive_ext, repo_path,
+                              changelog_range_info, archived_files, commits_info):
+    """Write a Markdown-formatted changelog."""
+    with open(changelog_path, 'w', encoding='utf-8') as f:
+        f.write(f"# Changelog for `{os.path.basename(archive_name_base)}{archive_ext}`\n\n")
+        f.write(f"- **Repository:** `{os.path.abspath(repo_path)}`\n")
+        for line in changelog_range_info.splitlines():
+            if ':' in line:
+                key, _, val = line.partition(':')
+                f.write(f"- **{key.strip()}:** {val.strip()}\n")
+            else:
+                f.write(f"- {line}\n")
+        f.write(f"- **Total Files Archived:** {len(archived_files)}\n\n")
+
+        if commits_info:
+            f.write(f"## Commits ({len(commits_info)})\n\n")
+            total_commit_files = 0
+            for i, commit in enumerate(commits_info, 1):
+                commit_archived_files = [c for c in commit.get('files', []) if c in archived_files]
+                total_commit_files += len(commit_archived_files)
+                merge_tag = " _(merge)_" if commit.get('is_merge', False) else ""
+                f.write(f"### {i}. `{commit['hash'][:10]}`{merge_tag} — {commit['message']}\n\n")
+                f.write(f"- **Author:** {commit['author_name']} &lt;{commit['author_email']}&gt;\n")
+                f.write(f"- **Date:** {commit['date']}\n")
+                f.write(f"- **Files Changed ({len(commit_archived_files)}):**\n")
+                if commit_archived_files:
+                    for file_path in sorted(commit_archived_files):
+                        f.write(f"  - `{file_path}`\n")
+                else:
+                    f.write(f"  - _(no archived files from this commit)_\n")
+                f.write("\n")
+
+            f.write(f"## Summary\n\n")
+            f.write(f"- Total commits: **{len(commits_info)}**\n")
+            f.write(f"- Total unique files archived: **{len(archived_files)}**\n")
+            f.write(f"- Total file changes across all commits: **{total_commit_files}**\n")
+        else:
+            f.write(f"## Archived Files ({len(archived_files)})\n\n")
+            for file_path in sorted(archived_files):
+                f.write(f"- `{file_path}`\n")
+
 
 def archive_git_history(params):
     """
@@ -238,19 +368,26 @@ def archive_git_history(params):
             if progress_callback:
                 progress_callback(10, "Getting commits from date range...")
             start_date, end_date, branch = params['start_date'], params['end_date'], params['branch']
+            author = params.get('author')
             range_display = f"{start_date} to {end_date}"
             changelog_range_info = f"Branch: {branch}\nDate Range: {range_display}"
+            if author:
+                changelog_range_info += f"\nAuthor Filter: {author}"
             log_callback(f"Mode: Date Range on branch '{branch}' from {range_display}")
+            if author:
+                log_callback(f"Author filter: {author}")
             latest_commit_cmd = ['git', 'rev-list', '-1', f'--before="{end_date} 23:59:59"', branch]
             latest_commit_hash = run_command(latest_commit_cmd, repo_path)
             if not latest_commit_hash:
                 log_callback(f"Error: Could not find a commit on branch '{branch}' before '{end_date}'.")
                 return
             log_cmd = ['git', 'log', branch, f'--since="{start_date} 00:00:00"', f'--until="{end_date} 23:59:59"', '--name-only', '--pretty=format:']
+            if author:
+                log_cmd.append(f'--author={author}')
             files_output = run_command(log_cmd, repo_path)
             check_cancel()
             # Get commit details with files for date range
-            commits_info = get_commits_with_files(repo_path, 'date', branch=branch, start_date=start_date, end_date=end_date)
+            commits_info = get_commits_with_files(repo_path, 'date', branch=branch, start_date=start_date, end_date=end_date, author=author)
 
         elif mode == 'sha_range':
             check_cancel()
@@ -355,64 +492,29 @@ def archive_git_history(params):
         check_cancel()
         if progress_callback:
             progress_callback(85, "Creating changelog file...")
-        changelog_path = f"{archive_name_base}.txt"
-        log_callback(f"Creating changelog file: {changelog_path}")
-        with open(changelog_path, 'w', encoding='utf-8') as f:
-            f.write(f"Changelog for {os.path.basename(archive_name_base)}{archive_ext}\n")
-            f.write("="*70 + "\n")
-            f.write(f"Repository: {os.path.abspath(repo_path)}\n")
-            f.write(changelog_range_info + "\n")
-            f.write(f"Total Files Archived: {len(archived_files)}\n")
-            f.write("="*70 + "\n\n")
-            
-            # Write commit information with their files
-            if commits_info:
-                f.write(f"Commits with Changed Files ({len(commits_info)}):\n")
-                f.write("="*70 + "\n")
-                
-                total_commit_files = 0
-                for i, commit in enumerate(commits_info, 1):
-                    # Filter files that were actually archived
-                    commit_archived_files = [f for f in commit.get('files', []) if f in archived_files]
-                    total_commit_files += len(commit_archived_files)
-                    
-                    commit_type = " [MERGE]" if commit.get('is_merge', False) else ""
-                    f.write(f"\n[{i}] Commit: {commit['hash'][:10]}{commit_type}\n")
-                    f.write(f"    Author: {commit['author_name']} <{commit['author_email']}>\n")
-                    f.write(f"    Date: {commit['date']}\n")
-                    f.write(f"    Message: {commit['message']}\n")
-                    
-                    if commit.get('is_merge', False):
-                        f.write(f"    Type: Merge Commit\n")
-                        if not commit_archived_files:
-                            f.write(f"    Note: Merge commits may not show direct file changes\n")
-                    
-                    f.write(f"    Files Changed ({len(commit_archived_files)}):\n")
-                    
-                    if commit_archived_files:
-                        for file_path in sorted(commit_archived_files):
-                            f.write(f"      - {file_path}\n")
-                    else:
-                        if commit.get('is_merge', False):
-                            f.write(f"      (Merge commit - files may have been changed in merged branches)\n")
-                        else:
-                            f.write(f"      (No files from this commit were archived)\n")
-                    f.write("-" * 60 + "\n")
-                    
-                f.write(f"\nSummary:\n")
-                f.write(f"- Total commits: {len(commits_info)}\n")
-                f.write(f"- Total unique files archived: {len(archived_files)}\n")
-                f.write(f"- Total file changes across all commits: {total_commit_files}\n")
-            else:
-                # Fallback for when no commit info is available
-                f.write(f"Archived Files ({len(archived_files)}):\n")
-                f.write("-" * 50 + "\n")
-                for file_path in sorted(archived_files):
-                    f.write(f"{file_path}\n")
+        changelog_format = params.get('changelog_format', 'txt')
+        if changelog_format == 'md':
+            changelog_path = f"{archive_name_base}.md"
+            log_callback(f"Creating changelog file: {changelog_path}")
+            _write_markdown_changelog(changelog_path, archive_name_base, archive_ext,
+                                      repo_path, changelog_range_info, archived_files, commits_info)
+        else:
+            changelog_path = f"{archive_name_base}.txt"
+            log_callback(f"Creating changelog file: {changelog_path}")
+            _write_text_changelog(changelog_path, archive_name_base, archive_ext,
+                                  repo_path, changelog_range_info, archived_files, commits_info)
         if progress_callback:
             progress_callback(100, "Process complete!")
         log_callback("Successfully created changelog file.")
         log_callback("\n--- PROCESS COMPLETE ---")
+        complete_callback = params.get('complete_callback', None)
+        if complete_callback:
+            complete_callback({
+                'success': True,
+                'archive_path': f"{archive_name_base}{archive_ext}",
+                'changelog_path': changelog_path,
+                'file_count': len(archived_files),
+            })
 
     except InterruptedError as e:
         log_callback(f"\n--- PROCESS CANCELLED ---")
@@ -423,6 +525,9 @@ def archive_git_history(params):
         log_callback(f"\nAn unexpected error occurred: {e}")
         if progress_callback:
             progress_callback(0, "Error occurred")
+        complete_callback = params.get('complete_callback', None)
+        if complete_callback:
+            complete_callback({'success': False, 'error': str(e)})
     finally:
         if 'temp_dir' in locals() and os.path.exists(temp_dir):
             log_callback(f"Cleaning up temporary directory: {temp_dir}")
