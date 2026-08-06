@@ -16,6 +16,16 @@ This tool creates a `.zip` file containing the specified files and a `.txt` chan
   - **Date Range:** Archive all changes on a specific branch within a start and end date.
   - **SHA Range:** Archive all changes between two specific commit SHAs.
   - **Single Commit:** Archive only the files that were modified in one specific commit.
+  - **Tag Range:** Build a release package from the changes between two Git tags.
+
+Date ranges and SHA ranges are inclusive: enter the actual first and last date/commit you want to package. You do not need to select the previous date or parent commit.
+- **Repository Dashboard:** See the active branch, remote, latest commit, working-tree state, and ahead/behind counts.
+- **Safe Remote Updates:** Fetch with pruning or pull using fast-forward-only mode.
+- **Interactive Preview:** Review Added, Modified, Deleted, Renamed, and Copied files and choose which changes to include.
+- **Deployment Deletion Manifest:** Every archive containing deletions includes `deleted_files.txt` for removing obsolete files from the target server.
+- **Branch and Tag Pickers:** Local/remote branches and tags are loaded from the selected repository.
+- **Date Tools:** Built-in calendar plus Today, Last 7 Days, and This Month presets.
+- **Exclude Rules:** Semicolon-separated glob patterns keep secrets, dependencies, or generated files out of a package.
 - **Dual Output:**
   - Creates a `.zip` archive with the full directory structure preserved.
   - Creates a `.txt` changelog file listing all included files and the range criteria.
@@ -71,6 +81,9 @@ If you want to run or modify the source code directly.
 
     # Example: by date range
     python git_archive_by_date.py "C:\path\to\your\repo" -o my_archive --branch main --start-date YYYY-MM-DD --end-date YYYY-MM-DD
+
+    # Example: between releases, with Markdown changelog and exclusions
+    python git_archive_by_date.py "C:\path\to\your\repo" -o release --start-tag v1.0 --end-tag v2.0 --changelog-format md --exclude ".env" --exclude "node_modules/*"
     
     ```
 
@@ -107,4 +120,3 @@ To create the executable file yourself:
 ## Author
 
 Created by **ekosiswoyo**
-

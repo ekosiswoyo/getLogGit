@@ -6,10 +6,12 @@ import json
 import threading
 import queue
 import subprocess
-from datetime import datetime
+import calendar
+from datetime import datetime, timedelta, date
 
 # Import the refactored logic from the other file
-from git_archive_by_date import archive_git_history, get_file_list_preview, get_recent_commits
+from git_archive_by_date import (archive_git_history, get_file_list_preview,
+                                 get_recent_commits, get_repository_info)
 from history_manager import HistoryManager
 
 
@@ -76,12 +78,13 @@ class App(tk.Tk):
         super().__init__()
 
         self.title("Git Archive Generator")
-        self.geometry("700x880")
-        self.minsize(660, 780)
+        self.geometry("780x900")
+        self.minsize(700, 700)
 
         # Threading control
         self.cancel_event = None
         self.archive_thread = None
+        self.git_pull_thread = None
 
         # History manager
         self.history_manager = HistoryManager()
@@ -130,6 +133,10 @@ class App(tk.Tk):
         self.start_sha = tk.StringVar()
         self.end_sha = tk.StringVar()
         self.commit_sha = tk.StringVar()
+        self.start_tag = tk.StringVar()
+        self.end_tag = tk.StringVar()
+        self.exclude_patterns = tk.StringVar(value=".git/*; .env; node_modules/*; __pycache__/*")
+        self.selected_files = None
 
         # Outer container
         self.outer = tk.Frame(self)
@@ -139,8 +146,21 @@ class App(tk.Tk):
 
         self._build_header(self.outer)
 
-        body = tk.Frame(self.outer)
-        body.pack(fill=tk.BOTH, expand=True, padx=18, pady=(4, 0))
+        body_shell = tk.Frame(self.outer)
+        body_shell.pack(fill=tk.BOTH, expand=True, padx=(18, 6), pady=(4, 0))
+        self._track(body_shell, lambda w, C: w.config(bg=C["BG"]))
+        body_canvas = tk.Canvas(body_shell, highlightthickness=0, bd=0)
+        body_scroll = ttk.Scrollbar(body_shell, orient=tk.VERTICAL, command=body_canvas.yview,
+                                    style="Modern.Vertical.TScrollbar")
+        body_canvas.configure(yscrollcommand=body_scroll.set)
+        body_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        body_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self._track(body_canvas, lambda w, C: w.config(bg=C["BG"]))
+        body = tk.Frame(body_canvas)
+        body_window = body_canvas.create_window((0, 0), window=body, anchor=tk.NW)
+        body.bind("<Configure>", lambda e: body_canvas.configure(scrollregion=body_canvas.bbox("all")))
+        body_canvas.bind("<Configure>", lambda e: body_canvas.itemconfigure(body_window, width=e.width))
+        body_canvas.bind_all("<MouseWheel>", lambda e: body_canvas.yview_scroll(int(-e.delta / 120), "units"))
         self._track(body, lambda w, C: w.config(bg=C["BG"]))
 
         self._build_paths_card(body)
@@ -389,22 +409,34 @@ class App(tk.Tk):
         self._label(inner, "Git Repo Folder").grid(row=0, column=0, sticky=tk.W, pady=6, padx=(0, 12))
         self.repo_combo = ttk.Combobox(inner, textvariable=self.repo_path, style="Modern.TCombobox")
         self.repo_combo.grid(row=0, column=1, sticky=tk.EW)
-        self.repo_combo.bind("<<ComboboxSelected>>", lambda e: self._validate_inputs())
+        self.repo_combo.bind("<<ComboboxSelected>>", lambda e: self.refresh_repository())
         self._refresh_recent_repos()
         self._make_button(inner, "Browse", self.browse_repo, kind="secondary").grid(row=0, column=2, padx=(10, 0))
+        self.git_pull_button = self._make_button(inner, "Git Pull", self.start_git_pull, kind="secondary")
+        self.git_pull_button.grid(row=0, column=3, padx=(8, 0))
+        self.fetch_button = self._make_button(inner, "Fetch", self.start_git_fetch, kind="secondary")
+        self.fetch_button.grid(row=0, column=4, padx=(8, 0))
 
         # repo validation hint
         self.repo_hint = tk.Label(inner, text="", font=(self.ui_font, 8), anchor=tk.W)
         self.repo_hint.grid(row=1, column=1, sticky=tk.W, pady=(0, 2))
         self._track(self.repo_hint, lambda w, C: w.config(bg=C["CARD"]))
 
-        self._label(inner, "Output File").grid(row=2, column=0, sticky=tk.W, pady=6, padx=(0, 12))
-        ttk.Entry(inner, textvariable=self.output_path, style="Modern.TEntry").grid(row=2, column=1, sticky=tk.EW)
-        self._make_button(inner, "Save As", self.browse_output, kind="secondary").grid(row=2, column=2, padx=(10, 0))
+        self.repo_status = tk.Label(inner, text="Repository status will appear here", font=(self.ui_font, 8),
+                                    anchor=tk.W, justify=tk.LEFT, wraplength=520)
+        self.repo_status.grid(row=2, column=1, columnspan=4, sticky=tk.EW, pady=(0, 5))
+        self._track(self.repo_status, lambda w, C: w.config(bg=C["CARD"], fg=C["TEXT_MUTED"]))
 
-        self._label(inner, "Archive Format").grid(row=3, column=0, sticky=tk.W, pady=6, padx=(0, 12))
+        self._label(inner, "Output File").grid(row=3, column=0, sticky=tk.W, pady=6, padx=(0, 12))
+        ttk.Entry(inner, textvariable=self.output_path, style="Modern.TEntry").grid(row=3, column=1, sticky=tk.EW)
+        self._make_button(inner, "Save As", self.browse_output, kind="secondary").grid(row=3, column=2, padx=(10, 0))
+
+        self._label(inner, "Archive Format").grid(row=4, column=0, sticky=tk.W, pady=6, padx=(0, 12))
         fmt_row = tk.Frame(inner)
-        fmt_row.grid(row=3, column=1, sticky=tk.EW)
+        fmt_row.grid(row=4, column=1, sticky=tk.EW)
+
+        self._label(inner, "Exclude").grid(row=5, column=0, sticky=tk.W, pady=6, padx=(0, 12))
+        ttk.Entry(inner, textvariable=self.exclude_patterns, style="Modern.TEntry").grid(row=5, column=1, columnspan=3, sticky=tk.EW)
         self._track(fmt_row, lambda w, C: w.config(bg=C["CARD"]))
         fmt_row.columnconfigure(0, weight=1)
         fmt_row.columnconfigure(2, weight=1)
@@ -421,7 +453,8 @@ class App(tk.Tk):
     def _build_mode_card(self, parent):
         inner = self._make_card(parent, "Select Mode", step=2)
         self._mode_buttons = {}
-        modes = [("Date Range", "date"), ("SHA Range", "sha_range"), ("Single Commit", "commit_sha")]
+        modes = [("Date Range", "date"), ("SHA Range", "sha_range"),
+                 ("Single Commit", "commit_sha"), ("Tag Range", "tag_range")]
         row = tk.Frame(inner)
         row.pack(fill=tk.X)
         self._track(row, lambda w, C: w.config(bg=C["CARD"]))
@@ -463,29 +496,39 @@ class App(tk.Tk):
         self._label(self.date_frame, "Start Date (YYYY-MM-DD)").grid(row=0, column=0, sticky=tk.W, pady=6, padx=(0, 12))
         self.start_date_entry = ttk.Entry(self.date_frame, textvariable=self.start_date, style="Modern.TEntry")
         self.start_date_entry.grid(row=0, column=1, sticky=tk.EW)
+        self._make_button(self.date_frame, "Calendar", lambda: self.open_date_picker(self.start_date),
+                          kind="secondary").grid(row=0, column=2, padx=(8, 0))
         self._label(self.date_frame, "End Date (YYYY-MM-DD)").grid(row=1, column=0, sticky=tk.W, pady=6, padx=(0, 12))
         self.end_date_entry = ttk.Entry(self.date_frame, textvariable=self.end_date, style="Modern.TEntry")
         self.end_date_entry.grid(row=1, column=1, sticky=tk.EW)
+        self._make_button(self.date_frame, "Calendar", lambda: self.open_date_picker(self.end_date),
+                          kind="secondary").grid(row=1, column=2, padx=(8, 0))
         self.date_hint = tk.Label(self.date_frame, text="", font=(self.ui_font, 8), anchor=tk.W)
         self.date_hint.grid(row=2, column=1, sticky=tk.W)
         self._track(self.date_hint, lambda w, C: w.config(bg=C["CARD"]))
         self._label(self.date_frame, "Branch").grid(row=3, column=0, sticky=tk.W, pady=6, padx=(0, 12))
-        self.branch_entry = ttk.Entry(self.date_frame, textvariable=self.branch, style="Modern.TEntry")
+        self.branch_entry = ttk.Combobox(self.date_frame, textvariable=self.branch, style="Modern.TCombobox")
         self.branch_entry.grid(row=3, column=1, sticky=tk.EW)
         self._label(self.date_frame, "Author (optional)").grid(row=4, column=0, sticky=tk.W, pady=6, padx=(0, 12))
         self.author_entry = ttk.Entry(self.date_frame, textvariable=self.author, style="Modern.TEntry")
         self.author_entry.grid(row=4, column=1, sticky=tk.EW)
+        preset_row = tk.Frame(self.date_frame)
+        preset_row.grid(row=5, column=1, columnspan=2, sticky=tk.W, pady=(5, 0))
+        self._track(preset_row, lambda w, C: w.config(bg=C["CARD"]))
+        for label, days in (("Today", 0), ("Last 7 Days", 6), ("This Month", -1)):
+            self._make_button(preset_row, label, lambda d=days: self.set_date_preset(d),
+                              kind="secondary").pack(side=tk.LEFT, padx=(0, 6))
 
         # SHA range mode
         self.sha_range_frame = tk.Frame(self.params_inner)
         self._track(self.sha_range_frame, lambda w, C: w.config(bg=C["CARD"]))
         self.sha_range_frame.columnconfigure(1, weight=1)
-        self._label(self.sha_range_frame, "Start SHA").grid(row=0, column=0, sticky=tk.W, pady=6, padx=(0, 12))
+        self._label(self.sha_range_frame, "Start SHA (included)").grid(row=0, column=0, sticky=tk.W, pady=6, padx=(0, 12))
         self.start_sha_entry = ttk.Entry(self.sha_range_frame, textvariable=self.start_sha, style="Modern.TEntry")
         self.start_sha_entry.grid(row=0, column=1, sticky=tk.EW)
         self._make_button(self.sha_range_frame, "Pick…", lambda: self.open_commit_picker(self.start_sha),
                           kind="secondary").grid(row=0, column=2, padx=(8, 0))
-        self._label(self.sha_range_frame, "End SHA").grid(row=1, column=0, sticky=tk.W, pady=6, padx=(0, 12))
+        self._label(self.sha_range_frame, "End SHA (included)").grid(row=1, column=0, sticky=tk.W, pady=6, padx=(0, 12))
         self.end_sha_entry = ttk.Entry(self.sha_range_frame, textvariable=self.end_sha, style="Modern.TEntry")
         self.end_sha_entry.grid(row=1, column=1, sticky=tk.EW)
         self._make_button(self.sha_range_frame, "Pick…", lambda: self.open_commit_picker(self.end_sha),
@@ -500,6 +543,18 @@ class App(tk.Tk):
         self.commit_sha_entry.grid(row=0, column=1, sticky=tk.EW)
         self._make_button(self.commit_sha_frame, "Pick…", lambda: self.open_commit_picker(self.commit_sha),
                           kind="secondary").grid(row=0, column=2, padx=(8, 0))
+
+        self.tag_range_frame = tk.Frame(self.params_inner)
+        self._track(self.tag_range_frame, lambda w, C: w.config(bg=C["CARD"]))
+        self.tag_range_frame.columnconfigure(1, weight=1)
+        self._label(self.tag_range_frame, "Start Tag").grid(row=0, column=0, sticky=tk.W, pady=6, padx=(0, 12))
+        self.start_tag_combo = ttk.Combobox(self.tag_range_frame, textvariable=self.start_tag,
+                                            state="readonly", style="Modern.TCombobox")
+        self.start_tag_combo.grid(row=0, column=1, sticky=tk.EW)
+        self._label(self.tag_range_frame, "End Tag").grid(row=1, column=0, sticky=tk.W, pady=6, padx=(0, 12))
+        self.end_tag_combo = ttk.Combobox(self.tag_range_frame, textvariable=self.end_tag,
+                                          state="readonly", style="Modern.TCombobox")
+        self.end_tag_combo.grid(row=1, column=1, sticky=tk.EW)
 
     def _build_progress(self, parent):
         wrapper = tk.Frame(parent)
@@ -552,7 +607,7 @@ class App(tk.Tk):
     # Validation
     # ------------------------------------------------------------------
     def _is_git_repo(self, path):
-        return bool(path) and os.path.isdir(path) and os.path.isdir(os.path.join(path, '.git'))
+        return bool(path) and os.path.isdir(path) and os.path.exists(os.path.join(path, '.git'))
 
     def _valid_date(self, text):
         if not text:
@@ -622,7 +677,184 @@ class App(tk.Tk):
         path = filedialog.askdirectory(title="Select Git Repository Folder")
         if path:
             self.repo_path.set(path)
-            self._validate_inputs()
+            self.refresh_repository()
+
+    def refresh_repository(self):
+        self._validate_inputs()
+        repo = self.repo_path.get().strip()
+        self.selected_files = None
+        if not self._is_git_repo(repo):
+            return
+        self.repo_status.config(text="Reading repository status...")
+        def load():
+            info = get_repository_info(repo)
+            self.after(0, lambda: self._show_repository_info(info))
+        threading.Thread(target=load, daemon=True).start()
+
+    def _show_repository_info(self, info):
+        if info.get('error'):
+            self.repo_status.config(text=info['error'], fg=self.C["DANGER"])
+            return
+        clean = "clean" if not info['dirty'] else f"{info['changes']} local change(s)"
+        sync = f"↑{info['ahead']} ↓{info['behind']}" if info['upstream'] else "no upstream"
+        self.repo_status.config(
+            text=f"{info['branch']}  ·  {sync}  ·  {clean}\n{info['last_commit']}  ·  {info['remote']}",
+            fg=self.C["OK"] if not info['dirty'] else self.C["WARN"]
+        )
+        self.branch_entry['values'] = info['branches']
+        if info['branch'] != '(detached HEAD)': self.branch.set(info['branch'])
+        self.start_tag_combo['values'] = info['tags']
+        self.end_tag_combo['values'] = info['tags']
+        if info['tags']:
+            if not self.end_tag.get(): self.end_tag.set(info['tags'][0])
+            if not self.start_tag.get() and len(info['tags']) > 1: self.start_tag.set(info['tags'][1])
+
+    def start_git_fetch(self):
+        repo = self.repo_path.get().strip()
+        if not self._is_git_repo(repo):
+            messagebox.showerror("Invalid repository", "Please select a valid Git repository first.")
+            return
+        self._set_button_state(self.fetch_button, "disabled")
+        self.progress_var.set("Fetching remote updates...")
+        def fetch():
+            try:
+                result = subprocess.run(['git', 'fetch', '--prune'], cwd=repo, capture_output=True,
+                                        text=True, encoding='utf-8', errors='replace')
+                message = (result.stdout + result.stderr).strip() or "Fetch complete."
+                self.after(0, lambda: self._finish_git_fetch(result.returncode == 0, message))
+            except Exception as exc:
+                message = str(exc)
+                self.after(0, lambda: self._finish_git_fetch(False, message))
+        threading.Thread(target=fetch, daemon=True).start()
+
+    def _finish_git_fetch(self, success, message):
+        self._set_button_state(self.fetch_button, "normal")
+        self.progress_var.set("Fetch complete" if success else "Fetch failed")
+        self.log(message)
+        self.refresh_repository()
+        if not success: messagebox.showerror("Git Fetch failed", message)
+
+    def set_date_preset(self, days):
+        today = date.today()
+        start = today.replace(day=1) if days == -1 else today - timedelta(days=days)
+        self.start_date.set(start.isoformat())
+        self.end_date.set(today.isoformat())
+
+    def open_date_picker(self, target_var):
+        try:
+            selected = datetime.strptime(target_var.get(), "%Y-%m-%d").date()
+        except ValueError:
+            selected = date.today()
+        win = tk.Toplevel(self); win.title("Select Date"); win.resizable(False, False)
+        state = [selected.year, selected.month]
+        calendar_frame = tk.Frame(win); calendar_frame.pack(padx=8, pady=8)
+
+        def choose(year, month, day):
+            target_var.set(date(year, month, day).isoformat()); win.destroy()
+
+        def move(delta):
+            year, month = state
+            month += delta
+            if month == 0: year, month = year - 1, 12
+            elif month == 13: year, month = year + 1, 1
+            state[:] = [year, month]; draw()
+
+        def draw():
+            for widget in calendar_frame.winfo_children(): widget.destroy()
+            year, month = state
+            tk.Button(calendar_frame, text='‹', command=lambda: move(-1), width=3).grid(row=0, column=0)
+            tk.Label(calendar_frame, text=f"{calendar.month_name[month]} {year}",
+                     font=(self.ui_font, 11, 'bold')).grid(row=0, column=1, columnspan=5, pady=8)
+            tk.Button(calendar_frame, text='›', command=lambda: move(1), width=3).grid(row=0, column=6)
+            for col, name in enumerate(('Mo','Tu','We','Th','Fr','Sa','Su')):
+                tk.Label(calendar_frame, text=name, width=4).grid(row=1, column=col)
+            for row, week in enumerate(calendar.monthcalendar(year, month), 2):
+                for col, day_number in enumerate(week):
+                    if day_number:
+                        tk.Button(calendar_frame, text=str(day_number), width=4,
+                                  command=lambda d=day_number, y=year, m=month: choose(y, m, d)).grid(row=row, column=col)
+        draw()
+
+    def start_git_pull(self):
+        """Safely update the selected repository without blocking the UI."""
+        repo_path = self.repo_path.get().strip()
+        if not self._is_git_repo(repo_path):
+            messagebox.showerror(
+                "Invalid repository",
+                "Please select a valid Git repository before pulling."
+            )
+            return
+        if self.git_pull_thread and self.git_pull_thread.is_alive():
+            return
+
+        try:
+            status = subprocess.run(
+                ["git", "status", "--porcelain"], cwd=repo_path,
+                capture_output=True, text=True, encoding="utf-8", errors="replace"
+            )
+        except FileNotFoundError:
+            messagebox.showerror("Git Pull failed", "Git is not installed or is not available in PATH.")
+            return
+        if status.returncode != 0:
+            detail = status.stderr.strip() or status.stdout.strip() or "Could not read repository status."
+            messagebox.showerror("Git Pull failed", detail)
+            return
+
+        use_autostash = bool(status.stdout.strip())
+        if use_autostash and not messagebox.askyesno(
+                "Local changes detected",
+                "This repository has local changes. Git will temporarily stash tracked changes, "
+                "pull with fast-forward only, then restore those changes.\n\nContinue?"):
+            return
+
+        self._set_button_state(self.git_pull_button, "disabled")
+        self.progress_var.set("Pulling latest changes...")
+        self.log("--- GIT PULL ---")
+        self.git_pull_thread = threading.Thread(
+            target=self._run_git_pull,
+            args=(repo_path, use_autostash),
+            daemon=True
+        )
+        self.git_pull_thread.start()
+
+    def _run_git_pull(self, repo_path, use_autostash=False):
+        startupinfo = None
+        if os.name == "nt":
+            startupinfo = subprocess.STARTUPINFO()
+            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+
+        def run_git(*args):
+            return subprocess.run(
+                ["git", *args], cwd=repo_path, capture_output=True, text=True,
+                encoding="utf-8", errors="replace", startupinfo=startupinfo
+            )
+
+        try:
+            pull_args = ["pull", "--ff-only"]
+            if use_autostash:
+                pull_args.append("--autostash")
+            result = run_git(*pull_args)
+            output = "\n".join(
+                part.strip() for part in (result.stdout, result.stderr) if part.strip()
+            )
+            success = result.returncode == 0
+            self.after(0, lambda: self._finish_git_pull(success, output or "Git Pull completed."))
+        except FileNotFoundError:
+            self.after(0, lambda: self._finish_git_pull(False, "Git is not installed or is not available in PATH."))
+        except Exception as exc:
+            message = str(exc)
+            self.after(0, lambda: self._finish_git_pull(False, message))
+
+    def _finish_git_pull(self, success, message):
+        self._set_button_state(self.git_pull_button, "normal")
+        self.progress_var.set("Git Pull complete" if success else "Git Pull failed")
+        self.log(message)
+        self.git_pull_thread = None
+        self.refresh_repository()
+        if success:
+            messagebox.showinfo("Git Pull", message)
+        else:
+            messagebox.showerror("Git Pull failed", message)
 
     def on_format_change(self, event=None):
         current_path = self.output_path.get()
@@ -654,12 +886,15 @@ class App(tk.Tk):
         self.date_frame.pack_forget()
         self.sha_range_frame.pack_forget()
         self.commit_sha_frame.pack_forget()
+        self.tag_range_frame.pack_forget()
         if mode == 'date':
             self.date_frame.pack(fill=tk.X)
         elif mode == 'sha_range':
             self.sha_range_frame.pack(fill=tk.X)
         elif mode == 'commit_sha':
             self.commit_sha_frame.pack(fill=tk.X)
+        elif mode == 'tag_range':
+            self.tag_range_frame.pack(fill=tk.X)
 
     def log(self, message):
         self.log_queue.put(message)
@@ -690,6 +925,9 @@ class App(tk.Tk):
     def update_progress(self, value, message):
         self.progress_queue.put((value, message))
 
+    def _exclude_list(self):
+        return [item.strip() for item in self.exclude_patterns.get().replace('\n', ';').split(';') if item.strip()]
+
     # ------------------------------------------------------------------
     # Completion handling (messageboxes + open folder)
     # ------------------------------------------------------------------
@@ -702,9 +940,11 @@ class App(tk.Tk):
             self._last_archive_path = result.get('archive_path', '')
             archive = result.get('archive_path', '')
             count = result.get('file_count', 0)
+            deleted = result.get('deleted_count', 0)
             folder = os.path.dirname(os.path.abspath(archive)) if archive else ''
             msg = (f"Archive created successfully.\n\n"
                    f"Files archived: {count}\n"
+                   f"Files to delete on deployment: {deleted}\n"
                    f"Output: {archive}\n\n"
                    f"Open the output folder now?")
             if messagebox.askyesno("Success", msg):
@@ -751,6 +991,13 @@ class App(tk.Tk):
             if not self.commit_sha.get().strip():
                 messagebox.showwarning("Missing SHA", "Commit SHA is required for Single Commit mode.")
                 return
+        elif mode == 'tag_range':
+            if not self.start_tag.get() or not self.end_tag.get():
+                messagebox.showwarning("Missing tags", "Start Tag and End Tag are required.")
+                return
+            if self.start_tag.get() == self.end_tag.get():
+                messagebox.showwarning("Invalid tags", "Start Tag and End Tag must be different.")
+                return
 
         self._set_button_state(self.run_button, "disabled")
         self._set_button_state(self.cancel_button, "normal")
@@ -779,7 +1026,11 @@ class App(tk.Tk):
             'author': self.author.get(),
             'start_sha': self.start_sha.get(),
             'end_sha': self.end_sha.get(),
-            'commit_sha': self.commit_sha.get()
+            'commit_sha': self.commit_sha.get(),
+            'start_tag': self.start_tag.get(),
+            'end_tag': self.end_tag.get(),
+            'exclude_patterns': self._exclude_list(),
+            'selected_files': self.selected_files
         }
 
         self.archive_thread = threading.Thread(target=archive_git_history, args=(params,))
@@ -826,7 +1077,10 @@ class App(tk.Tk):
             'author': self.author.get(),
             'start_sha': self.start_sha.get(),
             'end_sha': self.end_sha.get(),
-            'commit_sha': self.commit_sha.get()
+            'commit_sha': self.commit_sha.get(),
+            'start_tag': self.start_tag.get(),
+            'end_tag': self.end_tag.get(),
+            'exclude_patterns': self.exclude_patterns.get()
         }
         self.history_manager.add_entry(
             repo_path=self.repo_path.get(),
@@ -850,7 +1104,10 @@ class App(tk.Tk):
             'author': self.author.get(),
             'start_sha': self.start_sha.get(),
             'end_sha': self.end_sha.get(),
-            'commit_sha': self.commit_sha.get()
+            'commit_sha': self.commit_sha.get(),
+            'start_tag': self.start_tag.get(),
+            'end_tag': self.end_tag.get(),
+            'exclude_patterns': self._exclude_list()
         }
 
         if params['mode'] == 'date' and (not params['start_date'] or not params['end_date'] or not params['branch']):
@@ -861,6 +1118,9 @@ class App(tk.Tk):
             return
         elif params['mode'] == 'commit_sha' and not params['commit_sha']:
             messagebox.showwarning("Missing fields", "Please fill in Commit SHA for Single Commit mode.")
+            return
+        elif params['mode'] == 'tag_range' and (not params['start_tag'] or not params['end_tag']):
+            messagebox.showwarning("Missing fields", "Please select both tags for Tag Range mode.")
             return
 
         def run_preview():
@@ -887,36 +1147,70 @@ class App(tk.Tk):
 
         header = tk.Frame(win, bg=C["BG"])
         header.pack(fill=tk.X, padx=16, pady=(16, 8))
-        tk.Label(header, text=f"Total Files: {result['total_files']}", bg=C["BG"], fg=C["TEXT"],
+        size_text = f"{result.get('total_size', 0) / 1024:.1f} KB"
+        tk.Label(header, text=f"Changes: {result['total_files']}  ·  Deleted: {len(result.get('deleted_files', []))}  ·  Size: {size_text}", bg=C["BG"], fg=C["TEXT"],
                  font=(self.ui_font, 12, "bold")).pack(anchor=tk.W)
         if result.get('commit_hash'):
             tk.Label(header, text=f"Commit: {result['commit_hash'][:10]}", bg=C["BG"],
                      fg=C["TEXT_MUTED"], font=(self.ui_font, 9)).pack(anchor=tk.W)
+
+        search_var = tk.StringVar()
+        search_row = tk.Frame(win, bg=C["BG"]); search_row.pack(fill=tk.X, padx=16)
+        tk.Label(search_row, text="Filter:", bg=C["BG"], fg=C["TEXT_MUTED"]).pack(side=tk.LEFT)
+        ttk.Entry(search_row, textvariable=search_var, style="Modern.TEntry").pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(6, 0))
 
         list_frame = tk.Frame(win, bg=C["CARD"], highlightbackground=C["BORDER"], highlightthickness=1)
         list_frame.pack(fill=tk.BOTH, expand=True, padx=16, pady=8)
 
         scrollbar = ttk.Scrollbar(list_frame, style="Modern.Vertical.TScrollbar")
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-        file_listbox = tk.Listbox(list_frame, yscrollcommand=scrollbar.set, bg=C["INPUT_BG"], fg=C["TEXT"],
-                                  relief="flat", bd=0, highlightthickness=0, selectbackground=C["ACCENT"],
-                                  selectforeground="#ffffff", font=(MONO_FONT, 9))
-        file_listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        scrollbar.config(command=file_listbox.yview)
+        tree = ttk.Treeview(list_frame, columns=('pick', 'status', 'size', 'commit', 'path'), show='headings',
+                            yscrollcommand=scrollbar.set, style='Modern.Treeview')
+        tree.heading('pick', text='Include'); tree.column('pick', width=65, anchor=tk.CENTER)
+        tree.heading('status', text='Status'); tree.column('status', width=85)
+        tree.heading('size', text='Size'); tree.column('size', width=70, anchor=tk.E)
+        tree.heading('commit', text='Commit'); tree.column('commit', width=75)
+        tree.heading('path', text='File'); tree.column('path', width=330)
+        tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scrollbar.config(command=tree.yview)
+        labels = {'A':'Added', 'M':'Modified', 'D':'Deleted', 'R':'Renamed', 'C':'Copied'}
+        included = set(result['files'])
+        def populate(*args):
+            tree.delete(*tree.get_children())
+            term = search_var.get().lower()
+            for index, change in enumerate(result['changes']):
+                if term and term not in (change['path'] + ' ' + labels.get(change['status'], '')).lower(): continue
+                size = '—' if change['status'] == 'D' else f"{change.get('size', 0) / 1024:.1f} KB"
+                tree.insert('', tk.END, iid=str(index), values=(
+                    '☑' if change['path'] in included else '☐', labels.get(change['status'], change['status']),
+                    size, change.get('commit', ''), change['path']))
+        populate()
+        search_var.trace_add('write', populate)
 
-        for file_path in result['files']:
-            file_listbox.insert(tk.END, file_path)
+        def toggle(event=None):
+            for item in tree.selection():
+                path = tree.set(item, 'path')
+                if path in included: included.remove(path); tree.set(item, 'pick', '☐')
+                else: included.add(path); tree.set(item, 'pick', '☑')
+        tree.bind('<Double-1>', toggle)
 
         btn_row = tk.Frame(win, bg=C["BG"])
         btn_row.pack(fill=tk.X, padx=16, pady=12)
 
         def copy_list():
             self.clipboard_clear()
-            self.clipboard_append("\n".join(result['files']))
-            self.log(f"Copied {len(result['files'])} file paths to clipboard.")
+            self.clipboard_append("\n".join(sorted(included)))
+            self.log(f"Copied {len(included)} file paths to clipboard.")
+
+        def apply_selection():
+            self.selected_files = sorted(included)
+            self.log(f"Applied preview selection: {len(included)} change(s).")
+            win.destroy()
 
         self._make_button(btn_row, "Copy List", copy_list, kind="secondary").pack(side=tk.LEFT)
-        self._make_button(btn_row, "Close", win.destroy, kind="primary").pack(side=tk.RIGHT)
+        self._make_button(btn_row, "Toggle Selected", toggle, kind="secondary").pack(side=tk.LEFT, padx=6)
+        self._make_button(btn_row, "Apply Selection", apply_selection, kind="primary").pack(side=tk.RIGHT)
+        self._make_button(btn_row, "Close", win.destroy, kind="secondary").pack(side=tk.RIGHT, padx=6)
 
     # ------------------------------------------------------------------
     # Commit picker
@@ -1098,10 +1392,13 @@ class App(tk.Tk):
         self.start_sha.set(params.get('start_sha', ''))
         self.end_sha.set(params.get('end_sha', ''))
         self.commit_sha.set(params.get('commit_sha', ''))
+        self.start_tag.set(params.get('start_tag', ''))
+        self.end_tag.set(params.get('end_tag', ''))
+        self.exclude_patterns.set(params.get('exclude_patterns', self.exclude_patterns.get()))
 
         self._refresh_mode_buttons()
         self.on_mode_change()
-        self._validate_inputs()
+        self.refresh_repository()
         self.log("Loaded configuration from history.")
 
 

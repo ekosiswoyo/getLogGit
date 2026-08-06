@@ -6,6 +6,7 @@ import subprocess
 import shutil
 import tempfile
 import json
+import fnmatch
 from datetime import datetime
 
 # This script can be run as a standalone CLI or imported by another script (like a UI).
@@ -31,6 +32,104 @@ def run_command(command, cwd):
         return result.stdout.strip()
     except subprocess.CalledProcessError:
         return None
+
+
+def is_git_repository(path):
+    """Support normal repositories and linked worktrees (.git can be a file)."""
+    return bool(path) and os.path.isdir(path) and os.path.exists(os.path.join(path, '.git'))
+
+
+def get_repository_info(repo_path):
+    """Return the repository dashboard data used by the GUI."""
+    if not is_git_repository(repo_path):
+        return {'error': f"Not a valid git repository: '{repo_path}'"}
+    branch = run_command(['git', 'branch', '--show-current'], repo_path) or '(detached HEAD)'
+    remote = run_command(['git', 'remote', 'get-url', 'origin'], repo_path) or '(no origin)'
+    last = run_command(['git', 'log', '-1', '--pretty=format:%h|%ad|%s', '--date=short'], repo_path) or ''
+    dirty = run_command(['git', 'status', '--porcelain'], repo_path)
+    upstream = run_command(['git', 'rev-parse', '--abbrev-ref', '--symbolic-full-name', '@{upstream}'], repo_path)
+    ahead = behind = 0
+    if upstream:
+        counts = run_command(['git', 'rev-list', '--left-right', '--count', f'{upstream}...HEAD'], repo_path)
+        if counts:
+            behind, ahead = (int(value) for value in counts.split())
+    branches = (run_command(['git', 'for-each-ref', '--format=%(refname:short)',
+                             'refs/heads', 'refs/remotes'], repo_path) or '').splitlines()
+    branches = sorted({b for b in branches if not b.endswith('/HEAD')})
+    tags = (run_command(['git', 'tag', '--sort=-creatordate'], repo_path) or '').splitlines()
+    return {'error': None, 'branch': branch, 'remote': remote, 'last_commit': last,
+            'dirty': bool(dirty), 'changes': len(dirty.splitlines()) if dirty else 0,
+            'upstream': upstream, 'ahead': ahead, 'behind': behind,
+            'branches': branches, 'tags': tags}
+
+
+def _parse_name_status(output):
+    changes = []
+    for line in (output or '').splitlines():
+        parts = line.split('\t')
+        if len(parts) < 2:
+            continue
+        code = parts[0][0]
+        old_path = parts[1] if code in ('R', 'C') and len(parts) > 2 else None
+        path = parts[2] if old_path else parts[1]
+        changes.append({'status': code, 'path': path, 'old_path': old_path})
+    return changes
+
+
+def _resolve_changes(params):
+    repo_path, mode = params['repo_path'], params['mode']
+    commits_info, range_info = [], ''
+    if mode == 'date':
+        start, end, branch = params['start_date'], params['end_date'], params['branch']
+        author = params.get('author')
+        latest = run_command(['git', 'rev-list', '-1', f'--before={end} 23:59:59', branch], repo_path)
+        if not latest:
+            return {'error': f"Could not find a commit on branch '{branch}' before '{end}'."}
+        if author:
+            cmd = ['git', 'log', branch, f'--since={start} 00:00:00', f'--until={end} 23:59:59',
+                   '--name-status', '--format=', f'--author={author}']
+            output = run_command(cmd, repo_path)
+        else:
+            base = run_command(['git', 'rev-list', '-1', f'--before={start} 00:00:00', branch], repo_path)
+            base = base or '4b825dc642cb6eb9a060e54bf8d69288fbee4904'
+            output = run_command(['git', 'diff', '--name-status', '-M', base, latest], repo_path)
+        commits_info = get_commits_with_files(repo_path, mode, branch=branch, start_date=start, end_date=end, author=author)
+        range_info = f'Branch: {branch}\nDate Range: {start} to {end}' + (f'\nAuthor Filter: {author}' if author else '')
+    elif mode == 'sha_range':
+        start, latest = params['start_sha'], params['end_sha']
+        start_parent = run_command(['git', 'rev-parse', '--verify', f'{start}^'], repo_path)
+        base = start_parent or '4b825dc642cb6eb9a060e54bf8d69288fbee4904'
+        output = run_command(['git', 'diff', '--name-status', '-M', base, latest], repo_path)
+        commits_info = get_commits_with_files(repo_path, mode, start_sha=start, end_sha=latest)
+        range_info = f'SHA Range (inclusive): {start[:10]}..{latest[:10]}'
+    elif mode == 'commit_sha':
+        latest = params['commit_sha']
+        output = run_command(['git', 'diff-tree', '--root', '--no-commit-id', '--name-status', '-r', '-M', latest], repo_path)
+        commits_info = get_commits_with_files(repo_path, mode, commit_sha=latest)
+        range_info = f'Commit: {latest}'
+    elif mode == 'tag_range':
+        start, latest = params['start_tag'], params['end_tag']
+        output = run_command(['git', 'diff', '--name-status', '-M', f'{start}..{latest}'], repo_path)
+        commits_info = get_commits_with_files(repo_path, 'sha_range', start_sha=start, end_sha=latest)
+        range_info = f'Tag Range: {start}..{latest}'
+    else:
+        return {'error': f'Unknown mode: {mode}'}
+    if output is None:
+        return {'error': 'Failed to read changes from Git. Check the selected references.'}
+    excludes = [p.strip() for p in params.get('exclude_patterns', []) if p.strip()]
+    parsed = [c for c in _parse_name_status(output)
+              if not any(fnmatch.fnmatch(c['path'], p) or fnmatch.fnmatch(c['path'], p.rstrip('/') + '/*') for p in excludes)]
+    # git log returns newest commits first; retain the newest effective status per path.
+    changes_by_path = {}
+    for change in parsed:
+        changes_by_path.setdefault(change['path'], change)
+    changes = sorted(changes_by_path.values(), key=lambda item: item['path'])
+    selected = params.get('selected_files')
+    if selected is not None:
+        selected = set(selected)
+        changes = [c for c in changes if c['path'] in selected]
+    return {'error': None, 'changes': changes, 'commit_hash': latest,
+            'commits_info': commits_info, 'range_info': range_info}
 
 def get_commit_details(repo_path, commit_hash):
     """Get commit message, author, and date for a specific commit."""
@@ -62,14 +161,16 @@ def get_commits_in_range(repo_path, mode, **kwargs):
         start_date = kwargs.get('start_date')
         end_date = kwargs.get('end_date')
         author = kwargs.get('author')
-        log_cmd = ['git', 'log', branch, f'--since="{start_date} 00:00:00"', f'--until="{end_date} 23:59:59"', 
+        log_cmd = ['git', 'log', branch, f'--since={start_date} 00:00:00', f'--until={end_date} 23:59:59',
                    '--pretty=format:%H|%an|%ae|%ad|%s', '--date=iso']
         if author:
             log_cmd.append(f'--author={author}')
     elif mode == 'sha_range':
         start_sha = kwargs.get('start_sha')
         end_sha = kwargs.get('end_sha')
-        log_cmd = ['git', 'log', f'{start_sha}..{end_sha}', '--pretty=format:%H|%an|%ae|%ad|%s', '--date=iso']
+        start_parent = run_command(['git', 'rev-parse', '--verify', f'{start_sha}^'], repo_path)
+        revision_range = f'{start_parent}..{end_sha}' if start_parent else end_sha
+        log_cmd = ['git', 'log', revision_range, '--pretty=format:%H|%an|%ae|%ad|%s', '--date=iso']
     elif mode == 'commit_sha':
         commit_sha = kwargs.get('commit_sha')
         log_cmd = ['git', 'log', '-1', '--pretty=format:%H|%an|%ae|%ad|%s', '--date=iso', commit_sha]
@@ -96,7 +197,7 @@ def get_recent_commits(repo_path, limit=100, branch=None):
 
     Returns a list of dicts with hash, short_hash, author, date, message.
     """
-    if not os.path.isdir(repo_path) or not os.path.isdir(os.path.join(repo_path, '.git')):
+    if not is_git_repository(repo_path):
         return {'error': f"Not a valid git repository: '{repo_path}'", 'commits': []}
 
     log_cmd = ['git', 'log', f'-{limit}', '--pretty=format:%H|%an|%ad|%s', '--date=short']
@@ -181,62 +282,38 @@ def get_file_list_preview(params):
     Returns a dictionary with file list and metadata.
     """
     repo_path = params['repo_path']
-    mode = params['mode']
-    
-    if not os.path.isdir(repo_path) or not os.path.isdir(os.path.join(repo_path, '.git')):
+    if not is_git_repository(repo_path):
         return {'error': f"Not a valid git repository: '{repo_path}'"}
-    
-    files_output = None
-    latest_commit_hash = None
-    commits_info = []
-    
     try:
-        if mode == 'date':
-            start_date, end_date, branch = params['start_date'], params['end_date'], params['branch']
-            author = params.get('author')
-            latest_commit_cmd = ['git', 'rev-list', '-1', f'--before="{end_date} 23:59:59"', branch]
-            latest_commit_hash = run_command(latest_commit_cmd, repo_path)
-            if not latest_commit_hash:
-                return {'error': f"Could not find a commit on branch '{branch}' before '{end_date}'."}
-            log_cmd = ['git', 'log', branch, f'--since="{start_date} 00:00:00"', f'--until="{end_date} 23:59:59"', '--name-only', '--pretty=format:']
-            if author:
-                log_cmd.append(f'--author={author}')
-            files_output = run_command(log_cmd, repo_path)
-            commits_info = get_commits_with_files(repo_path, 'date', branch=branch, start_date=start_date, end_date=end_date, author=author)
-            
-        elif mode == 'sha_range':
-            start_sha, end_sha = params['start_sha'], params['end_sha']
-            latest_commit_hash = end_sha
-            diff_cmd = ['git', 'diff', '--name-only', f'{start_sha}..{end_sha}']
-            files_output = run_command(diff_cmd, repo_path)
-            commits_info = get_commits_with_files(repo_path, 'sha_range', start_sha=start_sha, end_sha=end_sha)
-            
-        elif mode == 'commit_sha':
-            commit_sha = params['commit_sha']
-            latest_commit_hash = commit_sha
-            show_cmd = ['git', 'show', '--name-only', '--pretty=format:', commit_sha]
-            files_output = run_command(show_cmd, repo_path)
-            commits_info = get_commits_with_files(repo_path, 'commit_sha', commit_sha=commit_sha)
-        
-        if files_output is None:
-            return {'error': "Failed to get file list from git. Check your parameters and that git is installed."}
-        
-        # Split lines and filter out empty strings
-        all_files = files_output.splitlines()
-        changed_files = sorted(list(set([f.strip() for f in all_files if f.strip()])))
-        
-        return {
-            'files': changed_files,
-            'total_files': len(changed_files),
-            'commit_hash': latest_commit_hash,
-            'commits_info': commits_info,
-            'error': None
-        }
+        result = _resolve_changes(params)
+        if result.get('error'):
+            return result
+        changes = result['changes']
+        total_size = 0
+        for change in changes:
+            if change['status'] == 'D':
+                change['size'] = 0
+            else:
+                raw_size = run_command(['git', 'cat-file', '-s',
+                                        f"{result['commit_hash']}:{change['path']}"], repo_path)
+                change['size'] = int(raw_size) if raw_size and raw_size.isdigit() else 0
+            change['commit'] = run_command(['git', 'log', '-1', '--format=%h',
+                                            result['commit_hash'], '--', change['path']], repo_path) or ''
+            total_size += change['size']
+        result.update({
+            'files': [c['path'] for c in changes],
+            'deleted_files': sorted({c['path'] for c in changes if c['status'] == 'D'} |
+                                    {c['old_path'] for c in changes if c['status'] == 'R' and c['old_path']}),
+            'total_files': len(changes),
+            'total_size': total_size,
+        })
+        return result
     except Exception as e:
         return {'error': str(e)}
 
 def _write_text_changelog(changelog_path, archive_name_base, archive_ext, repo_path,
-                          changelog_range_info, archived_files, commits_info):
+                          changelog_range_info, archived_files, commits_info,
+                          changes=None, deleted_files=None):
     """Write the classic plain-text changelog."""
     with open(changelog_path, 'w', encoding='utf-8') as f:
         f.write(f"Changelog for {os.path.basename(archive_name_base)}{archive_ext}\n")
@@ -244,6 +321,7 @@ def _write_text_changelog(changelog_path, archive_name_base, archive_ext, repo_p
         f.write(f"Repository: {os.path.abspath(repo_path)}\n")
         f.write(changelog_range_info + "\n")
         f.write(f"Total Files Archived: {len(archived_files)}\n")
+        f.write(f"Deleted Files: {len(deleted_files or [])}\n")
         f.write("=" * 70 + "\n\n")
 
         if commits_info:
@@ -286,11 +364,28 @@ def _write_text_changelog(changelog_path, archive_name_base, archive_ext, repo_p
             f.write("-" * 50 + "\n")
             for file_path in sorted(archived_files):
                 f.write(f"{file_path}\n")
+        if changes:
+            labels = {'A': 'Added', 'M': 'Modified', 'D': 'Deleted', 'R': 'Renamed', 'C': 'Copied'}
+            f.write("\nFile Status:\n" + "-" * 50 + "\n")
+            for change in changes:
+                f.write(f"[{labels.get(change['status'], change['status'])}] {change['path']}\n")
+        if deleted_files:
+            f.write("\nDEPLOYMENT DELETIONS (also in deleted_files.txt):\n")
+            for path in sorted(deleted_files):
+                f.write(f"DELETE {path}\n")
 
 
 def _write_markdown_changelog(changelog_path, archive_name_base, archive_ext, repo_path,
-                              changelog_range_info, archived_files, commits_info):
+                              changelog_range_info, archived_files, commits_info,
+                              changes=None, deleted_files=None):
     """Write a Markdown-formatted changelog."""
+    remote = run_command(['git', 'remote', 'get-url', 'origin'], repo_path) or ''
+    if remote.startswith('git@') and ':' in remote:
+        host_path = remote[4:].replace(':', '/', 1)
+        remote = 'https://' + host_path
+    if remote.endswith('.git'):
+        remote = remote[:-4]
+    web_remote = remote if remote.startswith(('http://', 'https://')) else ''
     with open(changelog_path, 'w', encoding='utf-8') as f:
         f.write(f"# Changelog for `{os.path.basename(archive_name_base)}{archive_ext}`\n\n")
         f.write(f"- **Repository:** `{os.path.abspath(repo_path)}`\n")
@@ -301,6 +396,7 @@ def _write_markdown_changelog(changelog_path, archive_name_base, archive_ext, re
             else:
                 f.write(f"- {line}\n")
         f.write(f"- **Total Files Archived:** {len(archived_files)}\n\n")
+        f.write(f"- **Deleted Files:** {len(deleted_files or [])}\n\n")
 
         if commits_info:
             f.write(f"## Commits ({len(commits_info)})\n\n")
@@ -309,7 +405,10 @@ def _write_markdown_changelog(changelog_path, archive_name_base, archive_ext, re
                 commit_archived_files = [c for c in commit.get('files', []) if c in archived_files]
                 total_commit_files += len(commit_archived_files)
                 merge_tag = " _(merge)_" if commit.get('is_merge', False) else ""
-                f.write(f"### {i}. `{commit['hash'][:10]}`{merge_tag} — {commit['message']}\n\n")
+                sha_label = f"`{commit['hash'][:10]}`"
+                if web_remote:
+                    sha_label = f"[`{commit['hash'][:10]}`]({web_remote}/commit/{commit['hash']})"
+                f.write(f"### {i}. {sha_label}{merge_tag} — {commit['message']}\n\n")
                 f.write(f"- **Author:** {commit['author_name']} &lt;{commit['author_email']}&gt;\n")
                 f.write(f"- **Date:** {commit['date']}\n")
                 f.write(f"- **Files Changed ({len(commit_archived_files)}):**\n")
@@ -328,6 +427,15 @@ def _write_markdown_changelog(changelog_path, archive_name_base, archive_ext, re
             f.write(f"## Archived Files ({len(archived_files)})\n\n")
             for file_path in sorted(archived_files):
                 f.write(f"- `{file_path}`\n")
+        if changes:
+            labels = {'A': 'Added', 'M': 'Modified', 'D': 'Deleted', 'R': 'Renamed', 'C': 'Copied'}
+            f.write("\n## File Status\n\n| Status | File |\n|---|---|\n")
+            for change in changes:
+                f.write(f"| {labels.get(change['status'], change['status'])} | `{change['path']}` |\n")
+        if deleted_files:
+            f.write("\n## Deployment Deletions\n\nThese paths must be removed from the deployment target and are also listed in `deleted_files.txt`.\n\n")
+            for path in sorted(deleted_files):
+                f.write(f"- `{path}`\n")
 
 
 def archive_git_history(params):
@@ -349,7 +457,7 @@ def archive_git_history(params):
             raise InterruptedError("Process cancelled by user")
 
     try:
-        if not os.path.isdir(repo_path) or not os.path.isdir(os.path.join(repo_path, '.git')):
+        if not is_git_repository(repo_path):
             log_callback(f"Error: Not a valid git repository: '{repo_path}'")
             return
 
@@ -358,75 +466,18 @@ def archive_git_history(params):
             progress_callback(5, "Validating repository...")
         log_callback(f"Processing repository: {os.path.abspath(repo_path)}")
 
-        files_output = None
-        latest_commit_hash = None
-        changelog_range_info = ""
-        commits_info = []
-
-        if mode == 'date':
-            check_cancel()
-            if progress_callback:
-                progress_callback(10, "Getting commits from date range...")
-            start_date, end_date, branch = params['start_date'], params['end_date'], params['branch']
-            author = params.get('author')
-            range_display = f"{start_date} to {end_date}"
-            changelog_range_info = f"Branch: {branch}\nDate Range: {range_display}"
-            if author:
-                changelog_range_info += f"\nAuthor Filter: {author}"
-            log_callback(f"Mode: Date Range on branch '{branch}' from {range_display}")
-            if author:
-                log_callback(f"Author filter: {author}")
-            latest_commit_cmd = ['git', 'rev-list', '-1', f'--before="{end_date} 23:59:59"', branch]
-            latest_commit_hash = run_command(latest_commit_cmd, repo_path)
-            if not latest_commit_hash:
-                log_callback(f"Error: Could not find a commit on branch '{branch}' before '{end_date}'.")
-                return
-            log_cmd = ['git', 'log', branch, f'--since="{start_date} 00:00:00"', f'--until="{end_date} 23:59:59"', '--name-only', '--pretty=format:']
-            if author:
-                log_cmd.append(f'--author={author}')
-            files_output = run_command(log_cmd, repo_path)
-            check_cancel()
-            # Get commit details with files for date range
-            commits_info = get_commits_with_files(repo_path, 'date', branch=branch, start_date=start_date, end_date=end_date, author=author)
-
-        elif mode == 'sha_range':
-            check_cancel()
-            if progress_callback:
-                progress_callback(10, "Getting commits from SHA range...")
-            start_sha, end_sha = params['start_sha'], params['end_sha']
-            range_display = f"{start_sha[:7]}..{end_sha[:7]}"
-            changelog_range_info = f"SHA Range: {range_display}"
-            log_callback(f"Mode: SHA Range {range_display}")
-            latest_commit_hash = end_sha
-            diff_cmd = ['git', 'diff', '--name-only', f'{start_sha}..{end_sha}']
-            files_output = run_command(diff_cmd, repo_path)
-            check_cancel()
-            # Get commit details with files for SHA range
-            commits_info = get_commits_with_files(repo_path, 'sha_range', start_sha=start_sha, end_sha=end_sha)
-
-        elif mode == 'commit_sha':
-            check_cancel()
-            if progress_callback:
-                progress_callback(10, "Getting commit details...")
-            commit_sha = params['commit_sha']
-            range_display = f"Single Commit: {commit_sha[:7]}"
-            changelog_range_info = f"Commit: {commit_sha}"
-            log_callback(f"Mode: {range_display}")
-            latest_commit_hash = commit_sha
-            show_cmd = ['git', 'show', '--name-only', '--pretty=format:', commit_sha]
-            files_output = run_command(show_cmd, repo_path)
-            check_cancel()
-            # Get commit details with files for single commit
-            commits_info = get_commits_with_files(repo_path, 'commit_sha', commit_sha=commit_sha)
-
-        if files_output is None:
-            log_callback("Error: Failed to get file list from git. Check your parameters and that git is installed.")
-            return
-
-        check_cancel()
-        # Split lines and filter out empty strings
-        all_files = files_output.splitlines()
-        changed_files = sorted(list(set([f.strip() for f in all_files if f.strip()])))
+        if progress_callback:
+            progress_callback(10, "Reading changes from Git...")
+        resolved = _resolve_changes(params)
+        if resolved.get('error'):
+            raise ValueError(resolved['error'])
+        latest_commit_hash = resolved['commit_hash']
+        changelog_range_info = resolved['range_info']
+        commits_info = resolved['commits_info']
+        changes = resolved['changes']
+        changed_files = [c['path'] for c in changes]
+        deleted_files = sorted({c['path'] for c in changes if c['status'] == 'D'} |
+                               {c['old_path'] for c in changes if c['status'] == 'R' and c['old_path']})
         if not changed_files:
             log_callback("No files changed in the specified range or commit.")
             return
@@ -447,7 +498,7 @@ def archive_git_history(params):
             if progress_callback:
                 progress = 20 + int((idx / total_files) * 50)  # 20-70% for file archiving
                 progress_callback(progress, f"Archiving file {idx+1}/{total_files}: {file_path[:50]}...")
-            if not file_path:
+            if not file_path or file_path in deleted_files:
                 continue
             dest_path = os.path.join(temp_dir, file_path)
             os.makedirs(os.path.dirname(dest_path), exist_ok=True)
@@ -465,10 +516,11 @@ def archive_git_history(params):
                 log_callback(f"Warning: Could not find '{file_path}' in commit {latest_commit_hash[:10]}. Skipping.")
         
         check_cancel()
-        if not archived_files:
-            log_callback("No files could be archived. Aborting.")
-            shutil.rmtree(temp_dir)
-            return
+        manifest_name = 'deleted_files.txt'
+        if deleted_files:
+            with open(os.path.join(temp_dir, manifest_name), 'w', encoding='utf-8') as manifest:
+                manifest.write('\n'.join(sorted(deleted_files)) + '\n')
+            log_callback(f"Added deletion manifest with {len(deleted_files)} file(s).")
 
         if progress_callback:
             format_name = {'zip': 'ZIP', 'tar': 'TAR', 'gztar': 'TAR.GZ'}.get(archive_format, 'ZIP')
@@ -497,12 +549,14 @@ def archive_git_history(params):
             changelog_path = f"{archive_name_base}.md"
             log_callback(f"Creating changelog file: {changelog_path}")
             _write_markdown_changelog(changelog_path, archive_name_base, archive_ext,
-                                      repo_path, changelog_range_info, archived_files, commits_info)
+                                      repo_path, changelog_range_info, archived_files, commits_info,
+                                      changes, deleted_files)
         else:
             changelog_path = f"{archive_name_base}.txt"
             log_callback(f"Creating changelog file: {changelog_path}")
             _write_text_changelog(changelog_path, archive_name_base, archive_ext,
-                                  repo_path, changelog_range_info, archived_files, commits_info)
+                                  repo_path, changelog_range_info, archived_files, commits_info,
+                                  changes, deleted_files)
         if progress_callback:
             progress_callback(100, "Process complete!")
         log_callback("Successfully created changelog file.")
@@ -514,6 +568,7 @@ def archive_git_history(params):
                 'archive_path': f"{archive_name_base}{archive_ext}",
                 'changelog_path': changelog_path,
                 'file_count': len(archived_files),
+                'deleted_count': len(deleted_files),
             })
 
     except InterruptedError as e:
@@ -549,19 +604,28 @@ def main():
     group.add_argument("--start-sha", help="The starting commit SHA for the range.")
     group.add_argument("--end-sha", help="The ending commit SHA for the range.")
     group.add_argument("--commit-sha", help="The single commit SHA to archive changes from.")
+    group.add_argument("--start-tag", help="The starting tag for a release range.")
+    group.add_argument("--end-tag", help="The ending tag for a release range.")
+    parser.add_argument("--archive-format", choices=['zip', 'tar', 'gztar'], default='zip')
+    parser.add_argument("--changelog-format", choices=['txt', 'md'], default='txt')
+    parser.add_argument("--exclude", action='append', default=[], help="Glob to exclude (repeatable).")
 
     args = parser.parse_args()
 
     params = {
         'repo_path': args.repo_path,
         'output_zip': args.output_zip,
+        'archive_format': args.archive_format,
+        'changelog_format': args.changelog_format,
+        'exclude_patterns': args.exclude,
     }
 
     is_date_mode = bool(args.start_date or args.end_date)
     is_sha_range_mode = bool(args.start_sha or args.end_sha)
     is_single_sha_mode = bool(args.commit_sha)
+    is_tag_range_mode = bool(args.start_tag or args.end_tag)
 
-    mode_count = sum([is_date_mode, is_sha_range_mode, is_single_sha_mode])
+    mode_count = sum([is_date_mode, is_sha_range_mode, is_single_sha_mode, is_tag_range_mode])
     if mode_count > 1:
         parser.error("argument conflict: please use only one method: date range, SHA range, or single commit.")
     if mode_count == 0:
@@ -585,8 +649,12 @@ def main():
     elif is_single_sha_mode:
         params.update({'mode': 'commit_sha', 'commit_sha': args.commit_sha})
 
+    elif is_tag_range_mode:
+        if not (args.start_tag and args.end_tag):
+            parser.error("for tag range mode, both --start-tag and --end-tag are required.")
+        params.update({'mode': 'tag_range', 'start_tag': args.start_tag, 'end_tag': args.end_tag})
+
     archive_git_history(params)
 
 if __name__ == "__main__":
     main()
-
