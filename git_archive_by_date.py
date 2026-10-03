@@ -36,7 +36,11 @@ def run_command(command, cwd):
 
 def is_git_repository(path):
     """Support normal repositories and linked worktrees (.git can be a file)."""
-    return bool(path) and os.path.isdir(path) and os.path.exists(os.path.join(path, '.git'))
+    if not path or not os.path.isdir(path):
+        return False
+    if os.path.exists(os.path.join(path, '.git')):
+        return True
+    return run_command(['git', 'rev-parse', '--is-bare-repository'], path) == 'true'
 
 
 def get_repository_info(repo_path):
@@ -97,11 +101,12 @@ def _resolve_changes(params):
         range_info = f'Branch: {branch}\nDate Range: {start} to {end}' + (f'\nAuthor Filter: {author}' if author else '')
     elif mode == 'sha_range':
         start, latest = params['start_sha'], params['end_sha']
-        start_parent = run_command(['git', 'rev-parse', '--verify', f'{start}^'], repo_path)
+        exclude_start = params.get('exclude_start', False)
+        start_parent = start if exclude_start else run_command(['git', 'rev-parse', '--verify', f'{start}^'], repo_path)
         base = start_parent or '4b825dc642cb6eb9a060e54bf8d69288fbee4904'
         output = run_command(['git', 'diff', '--name-status', '-M', base, latest], repo_path)
-        commits_info = get_commits_with_files(repo_path, mode, start_sha=start, end_sha=latest)
-        range_info = f'SHA Range (inclusive): {start[:10]}..{latest[:10]}'
+        commits_info = get_commits_with_files(repo_path, mode, start_sha=start, end_sha=latest, exclude_start=exclude_start)
+        range_info = f"SHA Range ({'start excluded' if exclude_start else 'inclusive'}): {start[:8]}..{latest[:8]}"
     elif mode == 'commit_sha':
         latest = params['commit_sha']
         output = run_command(['git', 'diff-tree', '--root', '--no-commit-id', '--name-status', '-r', '-M', latest], repo_path)
@@ -168,7 +173,7 @@ def get_commits_in_range(repo_path, mode, **kwargs):
     elif mode == 'sha_range':
         start_sha = kwargs.get('start_sha')
         end_sha = kwargs.get('end_sha')
-        start_parent = run_command(['git', 'rev-parse', '--verify', f'{start_sha}^'], repo_path)
+        start_parent = start_sha if kwargs.get('exclude_start', False) else run_command(['git', 'rev-parse', '--verify', f'{start_sha}^'], repo_path)
         revision_range = f'{start_parent}..{end_sha}' if start_parent else end_sha
         log_cmd = ['git', 'log', revision_range, '--pretty=format:%H|%an|%ae|%ad|%s', '--date=iso']
     elif mode == 'commit_sha':
@@ -602,6 +607,7 @@ def main():
     group.add_argument("-s", "--start-date", help="Start date in YYYY-MM-DD format.")
     group.add_argument("-e", "--end-date", help="End date in YYYY-MM-DD format.")
     group.add_argument("--start-sha", help="The starting commit SHA for the range.")
+    group.add_argument("--exclude-start", action="store_true", help="Exclude the starting commit in SHA range mode.")
     group.add_argument("--end-sha", help="The ending commit SHA for the range.")
     group.add_argument("--commit-sha", help="The single commit SHA to archive changes from.")
     group.add_argument("--start-tag", help="The starting tag for a release range.")
@@ -644,7 +650,7 @@ def main():
     elif is_sha_range_mode:
         if not (args.start_sha and args.end_sha):
             parser.error("for SHA range mode, both --start-sha and --end-sha are required.")
-        params.update({'mode': 'sha_range', 'start_sha': args.start_sha, 'end_sha': args.end_sha})
+        params.update({'mode': 'sha_range', 'start_sha': args.start_sha, 'end_sha': args.end_sha, 'exclude_start': args.exclude_start})
 
     elif is_single_sha_mode:
         params.update({'mode': 'commit_sha', 'commit_sha': args.commit_sha})

@@ -12,3 +12,6 @@ dist/
 history.json
 settings.json
 
+
+# Local build environment
+.venv/

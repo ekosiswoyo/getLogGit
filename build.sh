@@ -1,24 +1,26 @@
 #!/usr/bin/env bash
-# Build Git Archive Generator executable on Linux/macOS.
-set -e
-
-echo "Building Git Archive Generator..."
-
-# Ensure dependencies
-python3 -m pip show pyinstaller >/dev/null 2>&1 || python3 -m pip install pyinstaller
-python3 -m pip show Pillow >/dev/null 2>&1 || python3 -m pip install Pillow
-
-# Generate .ico (harmless on Linux; used if you later build for Windows)
-if [ -f logo.png ] && [ ! -f logo.ico ]; then
-    echo "Converting logo.png to logo.ico..."
-    python3 convert_icon.py || true
+# Build with a Python installation that includes Tk (Homebrew Python on macOS).
+set -euo pipefail
+cd "$(dirname "$0")"
+if [ -z "${BUILD_PYTHON:-}" ]; then
+    if [ -x .venv/bin/python ]; then
+        BUILD_PYTHON=.venv/bin/python
+    else
+        BUILD_PYTHON=python3
+    fi
 fi
+"$BUILD_PYTHON" -c 'import tkinter'
+"$BUILD_PYTHON" -m pip show pyinstaller Pillow >/dev/null 2>&1 || "$BUILD_PYTHON" -m pip install -r requirements.txt
 
-echo "Creating executable..."
-python3 -m PyInstaller --onefile --windowed --name GitArchiveGenerator \
-    --add-data "logo.png:." \
-    git_archive_ui.py
-
-echo ""
-echo "Build successful!"
-echo "Executable is located at: dist/GitArchiveGenerator"
+if [ "$(uname -s)" = "Darwin" ]; then
+    mkdir -p build
+    "$BUILD_PYTHON" -c 'from PIL import Image; Image.open("logo.png").convert("RGBA").save("build/logo.icns")'
+    "$BUILD_PYTHON" -m PyInstaller --noconfirm --onedir --windowed \
+        --name GitArchiveGenerator --osx-bundle-identifier com.ekosiswoyo.gitarchivegenerator \
+        --icon build/logo.icns --add-data "logo.png:." git_archive_ui.py
+    echo "App: dist/GitArchiveGenerator.app"
+else
+    "$BUILD_PYTHON" -m PyInstaller --noconfirm --onefile --windowed \
+        --name GitArchiveGenerator --add-data "logo.png:." git_archive_ui.py
+    echo "Executable: dist/GitArchiveGenerator"
+fi

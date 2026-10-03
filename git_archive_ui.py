@@ -7,12 +7,17 @@ import threading
 import queue
 import subprocess
 import calendar
+import webbrowser
 from datetime import datetime, timedelta, date
 
 # Import the refactored logic from the other file
 from git_archive_by_date import (archive_git_history, get_file_list_preview,
-                                 get_recent_commits, get_repository_info)
+                                 get_recent_commits, get_repository_info, is_git_repository)
 from history_manager import HistoryManager
+from app_storage import data_directory, legacy_paths
+from remote_repository import prepare_repository, normalize_url
+from rounded_theme import install_rounded_elements
+from macos_icon import set_dock_icon
 
 
 # ---------------------------------------------------------------------------
@@ -20,51 +25,51 @@ from history_manager import HistoryManager
 # ---------------------------------------------------------------------------
 PALETTES = {
     "dark": {
-        "BG": "#0f172a",
-        "CARD": "#1e293b",
-        "CARD_ALT": "#273449",
-        "BORDER": "#334155",
-        "TEXT": "#e2e8f0",
-        "TEXT_MUTED": "#94a3b8",
-        "ACCENT": "#6366f1",
-        "ACCENT_HOVER": "#818cf8",
+        "BG": "#1c1c1e",
+        "CARD": "#2c2c2e",
+        "CARD_ALT": "#363638",
+        "BORDER": "#48484a",
+        "TEXT": "#f2f2f7",
+        "TEXT_MUTED": "#98989d",
+        "ACCENT": "#007aff",
+        "ACCENT_HOVER": "#409cff",
         "DANGER": "#ef4444",
         "DANGER_HOVER": "#f87171",
         "WARN": "#f59e0b",
         "OK": "#22c55e",
-        "INPUT_BG": "#0b1220",
-        "DISABLED_BG": "#475569",
-        "DISABLED_FG": "#94a3b8",
-        "SECONDARY_BG": "#273449",
-        "SECONDARY_HOVER": "#334155",
-        "SECONDARY_FG": "#e2e8f0",
+        "INPUT_BG": "#232325",
+        "DISABLED_BG": "#48484a",
+        "DISABLED_FG": "#98989d",
+        "SECONDARY_BG": "#363638",
+        "SECONDARY_HOVER": "#48484a",
+        "SECONDARY_FG": "#f2f2f7",
     },
     "light": {
-        "BG": "#f1f5f9",
+        "BG": "#f5f5f7",
         "CARD": "#ffffff",
-        "CARD_ALT": "#e2e8f0",
-        "BORDER": "#cbd5e1",
-        "TEXT": "#1e293b",
-        "TEXT_MUTED": "#64748b",
-        "ACCENT": "#6366f1",
-        "ACCENT_HOVER": "#818cf8",
+        "CARD_ALT": "#f2f2f7",
+        "BORDER": "#d1d1d6",
+        "TEXT": "#2c2c2e",
+        "TEXT_MUTED": "#6c6c70",
+        "ACCENT": "#007aff",
+        "ACCENT_HOVER": "#409cff",
         "DANGER": "#ef4444",
         "DANGER_HOVER": "#f87171",
         "WARN": "#d97706",
         "OK": "#16a34a",
         "INPUT_BG": "#ffffff",
-        "DISABLED_BG": "#cbd5e1",
-        "DISABLED_FG": "#94a3b8",
-        "SECONDARY_BG": "#e2e8f0",
-        "SECONDARY_HOVER": "#cbd5e1",
-        "SECONDARY_FG": "#1e293b",
+        "DISABLED_BG": "#d1d1d6",
+        "DISABLED_FG": "#98989d",
+        "SECONDARY_BG": "#f2f2f7",
+        "SECONDARY_HOVER": "#d1d1d6",
+        "SECONDARY_FG": "#2c2c2e",
     },
 }
 
-FONT_PRIMARY = "Segoe UI"
+FONT_PRIMARY = "Helvetica Neue" if sys.platform == "darwin" else "Segoe UI"
 FONT_FALLBACK = "DejaVu Sans"
-MONO_FONT = "Consolas" if os.name == "nt" else "monospace"
-SETTINGS_FILE = "settings.json"
+MONO_FONT = "Consolas" if os.name == "nt" else "Menlo" if sys.platform == "darwin" else "monospace"
+SETTINGS_FILE = data_directory() / "settings.json"
 
 
 def resource_path(rel):
@@ -87,7 +92,11 @@ class App(tk.Tk):
         self.git_pull_thread = None
 
         # History manager
-        self.history_manager = HistoryManager()
+        try:
+            self.history_manager = HistoryManager()
+        except OSError as exc:
+            messagebox.showwarning("History", f"Could not migrate history: {exc}")
+            self.history_manager = HistoryManager(history_file=data_directory() / "history.json")
         self._history_entries = {}
 
         # Theme state
@@ -103,7 +112,7 @@ class App(tk.Tk):
         try:
             ico = resource_path('logo.ico')
             png = resource_path('logo.png')
-            if os.path.exists(ico):
+            if sys.platform == "win32" and os.path.exists(ico):
                 self.iconbitmap(ico)
             elif os.path.exists(png):
                 try:
@@ -114,14 +123,27 @@ class App(tk.Tk):
         except Exception:
             pass
 
+        if sys.platform == "darwin":
+            try:
+                self._dock_icon_set = set_dock_icon(resource_path('logo.png'))
+            except (OSError, AttributeError):
+                self._dock_icon_set = False
+
         self.style = ttk.Style(self)
         try:
             self.style.theme_use('clam')
         except tk.TclError:
             pass
 
+        install_rounded_elements(self, PALETTES)
+
         # State vars
         self.repo_path = tk.StringVar()
+        self.source_mode = tk.StringVar(value="Local folder")
+        self.remote_url = tk.StringVar()
+        self.remote_url.trace_add("write", lambda *args: self.invalidate_remote())
+        self.remote_busy = False
+        self.remote_connected_url = ''
         self.output_path = tk.StringVar()
         self.archive_format = tk.StringVar(value="zip")
         self.changelog_format = tk.StringVar(value="txt")
@@ -131,6 +153,7 @@ class App(tk.Tk):
         self.branch = tk.StringVar(value="main")
         self.author = tk.StringVar()
         self.start_sha = tk.StringVar()
+        self.exclude_start = tk.BooleanVar(value=False)
         self.end_sha = tk.StringVar()
         self.commit_sha = tk.StringVar()
         self.start_tag = tk.StringVar()
@@ -160,7 +183,12 @@ class App(tk.Tk):
         body_window = body_canvas.create_window((0, 0), window=body, anchor=tk.NW)
         body.bind("<Configure>", lambda e: body_canvas.configure(scrollregion=body_canvas.bbox("all")))
         body_canvas.bind("<Configure>", lambda e: body_canvas.itemconfigure(body_window, width=e.width))
-        body_canvas.bind_all("<MouseWheel>", lambda e: body_canvas.yview_scroll(int(-e.delta / 120), "units"))
+        def scroll_body(event):
+            if event.widget.winfo_toplevel() != self or isinstance(event.widget, (tk.Text, ttk.Treeview)):
+                return
+            delta = -event.delta if sys.platform == "darwin" else int(-event.delta / 120)
+            body_canvas.yview_scroll(int(delta), "units")
+        body_canvas.bind_all("<MouseWheel>", scroll_body)
         self._track(body, lambda w, C: w.config(bg=C["BG"]))
 
         self._build_paths_card(body)
@@ -180,10 +208,13 @@ class App(tk.Tk):
         self._validate_inputs()
 
         # Threading and queues
+        self.ui_queue = queue.Queue()
+        self.completion_queue = queue.Queue()
         self.log_queue = queue.Queue()
         self.progress_queue = queue.Queue()
         self.after(100, self.process_log_queue)
         self.after(100, self.process_progress_queue)
+        self.after(100, self.process_completion_queue)
 
         self.after(200, self.center_window)
 
@@ -204,6 +235,14 @@ class App(tk.Tk):
             except tk.TclError:
                 pass
         self._refresh_mode_buttons()
+        def update_fields(parent):
+            for child in parent.winfo_children():
+                if isinstance(child, ttk.Combobox):
+                    child.configure(style=f"{self.theme_name}.Modern.TCombobox")
+                elif isinstance(child, ttk.Entry):
+                    child.configure(style=f"{self.theme_name}.Modern.TEntry")
+                update_fields(child)
+        update_fields(self)
 
     def toggle_theme(self):
         self.theme_name = "light" if self.theme_name == "dark" else "dark"
@@ -219,8 +258,11 @@ class App(tk.Tk):
 
     def _load_theme_pref(self):
         try:
-            if os.path.exists(SETTINGS_FILE):
-                with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
+            candidates = [SETTINGS_FILE] if SETTINGS_FILE.exists() else legacy_paths("settings.json")
+            for candidate in candidates:
+                if not candidate.is_file():
+                    continue
+                with open(candidate, "r", encoding="utf-8") as f:
                     data = json.load(f)
                     name = data.get("theme", "dark")
                     if name in PALETTES:
@@ -236,6 +278,7 @@ class App(tk.Tk):
                 with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
                     data = json.load(f)
             data["theme"] = self.theme_name
+            SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
             with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=2)
         except Exception:
@@ -255,17 +298,36 @@ class App(tk.Tk):
     def _style_ttk(self, C):
         f = self.ui_font
         s = self.style
+        for kind in ("primary", "secondary", "danger"):
+            base, hover, fg = self._btn_colors(kind)
+            name = f"{kind.title()}.TButton"
+            s.configure(name, font=(f, 10), padding=(8, 2), width=0,
+                        background=base, foreground=fg, borderwidth=0, relief="flat",
+                        bordercolor=base, lightcolor=base, darkcolor=base, focusthickness=1,
+                        focuscolor=C["ACCENT"])
+            s.map(name, background=[("disabled", C["DISABLED_BG"]), ("pressed", hover), ("active", hover)],
+                  foreground=[("disabled", C["DISABLED_FG"])])
+        s.configure("Modern.TCheckbutton", background=C["CARD"], foreground=C["TEXT"], font=(f, 10))
+        s.map("Modern.TCheckbutton", background=[("active", C["CARD"])],
+              foreground=[("disabled", C["DISABLED_FG"]), ("active", C["TEXT"])])
+        s.configure("Modern.TCheckbutton", indicatorbackground=C["INPUT_BG"],
+                    indicatorforeground=C["TEXT"], bordercolor=C["BORDER"])
+        s.map("Modern.TCheckbutton", indicatorbackground=[("selected", C["ACCENT"])])
 
         s.configure("Modern.TEntry", fieldbackground=C["INPUT_BG"], foreground=C["TEXT"],
                     bordercolor=C["BORDER"], lightcolor=C["BORDER"], darkcolor=C["BORDER"],
-                    insertcolor=C["TEXT"], padding=6)
+                    insertcolor=C["TEXT"], background=C["CARD"], padding=(6, 2))
         s.map("Modern.TEntry",
               bordercolor=[("focus", C["ACCENT"])],
               lightcolor=[("focus", C["ACCENT"])],
               darkcolor=[("focus", C["ACCENT"])])
 
         s.configure("Modern.TCombobox", fieldbackground=C["INPUT_BG"], background=C["CARD_ALT"],
-                    foreground=C["TEXT"], arrowcolor=C["TEXT"], bordercolor=C["BORDER"], padding=5)
+                    foreground=C["TEXT"], arrowcolor=C["TEXT"], bordercolor=C["BORDER"], lightcolor=C["BORDER"], darkcolor=C["BORDER"], padding=(6, 2))
+        s.map("Modern.TCombobox", fieldbackground=[("readonly", C["INPUT_BG"])],
+              foreground=[("disabled", C["DISABLED_FG"]), ("readonly", C["TEXT"])],
+              selectbackground=[("readonly", C["INPUT_BG"])],
+              selectforeground=[("readonly", C["TEXT"])])
         self.option_add("*TCombobox*Listbox.background", C["CARD"])
         self.option_add("*TCombobox*Listbox.foreground", C["TEXT"])
         self.option_add("*TCombobox*Listbox.selectBackground", C["ACCENT"])
@@ -290,24 +352,12 @@ class App(tk.Tk):
     # Widget factories
     # ------------------------------------------------------------------
     def _make_button(self, parent, text, command, kind="primary", width=None):
-        btn = tk.Button(parent, text=text, command=command, relief="flat", bd=0,
-                        font=(self.ui_font, 10, "bold"), cursor="hand2",
-                        padx=14, pady=8, highlightthickness=0)
+        btn = ttk.Button(parent, text=text, command=command,
+                         style=f"{self.theme_name}.{kind.title()}.TButton", cursor="hand2")
         if width:
             btn.config(width=width)
         btn._kind = kind
         btn._disabled = False
-
-        def on_enter(e):
-            if not btn._disabled:
-                btn.config(bg=self._btn_colors(btn._kind)[1])
-
-        def on_leave(e):
-            if not btn._disabled:
-                btn.config(bg=self._btn_colors(btn._kind)[0])
-
-        btn.bind("<Enter>", on_enter)
-        btn.bind("<Leave>", on_leave)
         self._track(btn, lambda w, C: self._recolor_button(w))
         return btn
 
@@ -320,12 +370,16 @@ class App(tk.Tk):
         return (C["SECONDARY_BG"], C["SECONDARY_HOVER"], C["SECONDARY_FG"])
 
     def _recolor_button(self, btn):
-        base, hover, fg = self._btn_colors(btn._kind)
-        if btn._disabled:
-            btn.config(bg=self.C["DISABLED_BG"], fg=self.C["DISABLED_FG"],
-                       activebackground=self.C["DISABLED_BG"], activeforeground=self.C["DISABLED_FG"])
-        else:
-            btn.config(bg=base, fg=fg, activebackground=hover, activeforeground=fg)
+        base_style = f"{self.theme_name}.{btn._kind.title()}.TButton"
+        surface = "Outer" if btn.master.cget("bg") == self.C["BG"] else "Card"
+        name = f"{self.theme_name}.{surface}.{btn._kind.title()}.TButton"
+        self.style.layout(name, self.style.layout(base_style))
+        surface_color = btn.master.cget("bg")
+        self.style.configure(name, background=surface_color)
+        # Transparent rounded corners must show the parent in every state.
+        self.style.map(name, background=[(state, surface_color) for state in
+                                        ("disabled", "pressed", "active", "focus")])
+        btn.configure(style=name)
 
     def _set_button_state(self, btn, state):
         btn._disabled = (state == "disabled")
@@ -404,51 +458,75 @@ class App(tk.Tk):
     def _build_paths_card(self, parent):
         inner = self._make_card(parent, "Select Paths", step=1)
         inner.columnconfigure(1, weight=1)
+        source = tk.Frame(inner)
+        source.grid(row=0, column=0, columnspan=5, sticky=tk.EW, pady=(10, 0))
+        self._track(source, lambda w, C: w.config(bg=C["CARD"]))
+        self._label(source, "Source").pack(side=tk.LEFT, padx=(0, 10))
+        selector = ttk.Combobox(source, textvariable=self.source_mode,
+                                values=("Local folder", "HTTPS URL"), state="readonly", width=13,
+                                style=f"{self.theme_name}.Modern.TCombobox")
+        selector.pack(side=tk.LEFT)
+        selector.bind("<<ComboboxSelected>>", self.change_source)
+        self.remote_panel = tk.Frame(inner)
+        self._track(self.remote_panel, lambda w, C: w.config(bg=C["CARD"]))
+        self.remote_panel.columnconfigure(1, weight=1)
+        self._label(self.remote_panel, "HTTPS clone URL").grid(row=0, column=0, padx=(0, 10))
+        ttk.Entry(self.remote_panel, textvariable=self.remote_url,
+                  style=f"{self.theme_name}.Modern.TEntry").grid(row=0, column=1, sticky=tk.EW, pady=4)
+        self.remote_connect_button = self._make_button(self.remote_panel, "Connect / Update", self.connect_remote,
+                                                      kind="secondary")
+        self.remote_connect_button.grid(row=0, column=2, padx=(8, 0))
+        self._label(self.remote_panel, "Private repo: PAT or Web login. Token is used for this connection only.",
+                    muted=True).grid(row=1, column=0, columnspan=3, sticky=tk.W, pady=(4, 0))
 
-        # Repo row with recent dropdown
-        self._label(inner, "Git Repo Folder").grid(row=0, column=0, sticky=tk.W, pady=6, padx=(0, 12))
-        self.repo_combo = ttk.Combobox(inner, textvariable=self.repo_path, style="Modern.TCombobox")
-        self.repo_combo.grid(row=0, column=1, sticky=tk.EW)
+        self.local_panel = tk.Frame(inner)
+        self.local_panel.grid(row=1, column=0, columnspan=5, sticky=tk.EW, pady=(8, 0))
+        self.local_panel.columnconfigure(1, weight=1)
+        self._track(self.local_panel, lambda w, C: w.config(bg=C["CARD"]))
+        self._label(self.local_panel, "Local Git folder").grid(row=0, column=0, sticky=tk.W, pady=6, padx=(0, 12))
+        self.repo_combo = ttk.Combobox(self.local_panel, textvariable=self.repo_path,
+                                       style=f"{self.theme_name}.Modern.TCombobox")
+        self.repo_combo.grid(row=0, column=1, sticky=tk.EW, pady=4)
         self.repo_combo.bind("<<ComboboxSelected>>", lambda e: self.refresh_repository())
         self._refresh_recent_repos()
-        self._make_button(inner, "Browse", self.browse_repo, kind="secondary").grid(row=0, column=2, padx=(10, 0))
-        self.git_pull_button = self._make_button(inner, "Git Pull", self.start_git_pull, kind="secondary")
+        self._make_button(self.local_panel, "Browse", self.browse_repo, kind="secondary").grid(row=0, column=2, padx=(10, 0))
+        self.git_pull_button = self._make_button(self.local_panel, "Git Pull", self.start_git_pull, kind="secondary")
         self.git_pull_button.grid(row=0, column=3, padx=(8, 0))
-        self.fetch_button = self._make_button(inner, "Fetch", self.start_git_fetch, kind="secondary")
+        self.fetch_button = self._make_button(self.local_panel, "Fetch", self.start_git_fetch, kind="secondary")
         self.fetch_button.grid(row=0, column=4, padx=(8, 0))
 
         # repo validation hint
         self.repo_hint = tk.Label(inner, text="", font=(self.ui_font, 8), anchor=tk.W)
-        self.repo_hint.grid(row=1, column=1, sticky=tk.W, pady=(0, 2))
+        self.repo_hint.grid(row=2, column=1, sticky=tk.W, pady=(0, 2))
         self._track(self.repo_hint, lambda w, C: w.config(bg=C["CARD"]))
 
         self.repo_status = tk.Label(inner, text="Repository status will appear here", font=(self.ui_font, 8),
                                     anchor=tk.W, justify=tk.LEFT, wraplength=520)
-        self.repo_status.grid(row=2, column=1, columnspan=4, sticky=tk.EW, pady=(0, 5))
+        self.repo_status.grid(row=3, column=1, columnspan=4, sticky=tk.EW, pady=(0, 5))
         self._track(self.repo_status, lambda w, C: w.config(bg=C["CARD"], fg=C["TEXT_MUTED"]))
 
-        self._label(inner, "Output File").grid(row=3, column=0, sticky=tk.W, pady=6, padx=(0, 12))
-        ttk.Entry(inner, textvariable=self.output_path, style="Modern.TEntry").grid(row=3, column=1, sticky=tk.EW)
-        self._make_button(inner, "Save As", self.browse_output, kind="secondary").grid(row=3, column=2, padx=(10, 0))
+        self._label(inner, "Output File").grid(row=4, column=0, sticky=tk.W, pady=6, padx=(0, 12))
+        ttk.Entry(inner, textvariable=self.output_path, style=f"{self.theme_name}.Modern.TEntry").grid(row=4, column=1, sticky=tk.EW, pady=4)
+        self._make_button(inner, "Save As", self.browse_output, kind="secondary").grid(row=4, column=2, padx=(10, 0))
 
-        self._label(inner, "Archive Format").grid(row=4, column=0, sticky=tk.W, pady=6, padx=(0, 12))
+        self._label(inner, "Archive Format").grid(row=5, column=0, sticky=tk.W, pady=6, padx=(0, 12))
         fmt_row = tk.Frame(inner)
-        fmt_row.grid(row=4, column=1, sticky=tk.EW)
+        fmt_row.grid(row=5, column=1, columnspan=4, sticky=tk.EW)
 
-        self._label(inner, "Exclude").grid(row=5, column=0, sticky=tk.W, pady=6, padx=(0, 12))
-        ttk.Entry(inner, textvariable=self.exclude_patterns, style="Modern.TEntry").grid(row=5, column=1, columnspan=3, sticky=tk.EW)
+        self._label(inner, "Exclude").grid(row=6, column=0, sticky=tk.W, pady=6, padx=(0, 12))
+        ttk.Entry(inner, textvariable=self.exclude_patterns, style=f"{self.theme_name}.Modern.TEntry").grid(row=6, column=1, columnspan=3, sticky=tk.EW, pady=4)
         self._track(fmt_row, lambda w, C: w.config(bg=C["CARD"]))
         fmt_row.columnconfigure(0, weight=1)
         fmt_row.columnconfigure(2, weight=1)
         format_combo = ttk.Combobox(fmt_row, textvariable=self.archive_format,
-                                    values=["zip", "tar", "gztar"], state="readonly", style="Modern.TCombobox")
-        format_combo.grid(row=0, column=0, sticky=tk.EW)
+                                    values=["zip", "tar", "gztar"], width=8, state="readonly", style=f"{self.theme_name}.Modern.TCombobox")
+        format_combo.grid(row=0, column=0, sticky=tk.EW, pady=4)
         format_combo.bind("<<ComboboxSelected>>", self.on_format_change)
         cl = self._label(fmt_row, "Changelog")
         cl.grid(row=0, column=1, padx=(12, 6))
         changelog_combo = ttk.Combobox(fmt_row, textvariable=self.changelog_format,
-                                       values=["txt", "md"], state="readonly", width=6, style="Modern.TCombobox")
-        changelog_combo.grid(row=0, column=2, sticky=tk.EW)
+                                       values=["txt", "md"], state="readonly", width=6, style=f"{self.theme_name}.Modern.TCombobox")
+        changelog_combo.grid(row=0, column=2, sticky=tk.EW, pady=4)
 
     def _build_mode_card(self, parent):
         inner = self._make_card(parent, "Select Mode", step=2)
@@ -458,11 +536,11 @@ class App(tk.Tk):
         row = tk.Frame(inner)
         row.pack(fill=tk.X)
         self._track(row, lambda w, C: w.config(bg=C["CARD"]))
-        for label, value in modes:
-            b = tk.Button(row, text=label, command=lambda v=value: self._select_mode(v),
-                          relief="flat", bd=0, cursor="hand2", font=(self.ui_font, 10, "bold"),
-                          padx=14, pady=8, highlightthickness=0)
-            b.pack(side=tk.LEFT, padx=(0, 8))
+        for index, (label, value) in enumerate(modes):
+            b = self._make_button(row, label, lambda v=value: self._select_mode(v),
+                                  kind="secondary")
+            row.columnconfigure(index, weight=1, uniform="modes")
+            b.grid(row=0, column=index, sticky=tk.EW, padx=(0, 8 if index < 3 else 0))
             self._mode_buttons[value] = b
 
     def _select_mode(self, value):
@@ -479,12 +557,8 @@ class App(tk.Tk):
         for value, btn in self._mode_buttons.items():
             if not btn.winfo_exists():
                 continue
-            if value == current:
-                btn.config(bg=C["ACCENT"], fg="#ffffff",
-                           activebackground=C["ACCENT_HOVER"], activeforeground="#ffffff")
-            else:
-                btn.config(bg=C["SECONDARY_BG"], fg=C["TEXT_MUTED"],
-                           activebackground=C["SECONDARY_HOVER"], activeforeground=C["TEXT"])
+            btn.configure(style=f"{self.theme_name}.Primary.TButton" if value == current else f"{self.theme_name}.Secondary.TButton")
+            btn.state(["pressed"] if value == current else ["!pressed"])
 
     def _build_params_card(self, parent):
         self.params_inner = self._make_card(parent, "Parameters", step=3)
@@ -494,24 +568,24 @@ class App(tk.Tk):
         self._track(self.date_frame, lambda w, C: w.config(bg=C["CARD"]))
         self.date_frame.columnconfigure(1, weight=1)
         self._label(self.date_frame, "Start Date (YYYY-MM-DD)").grid(row=0, column=0, sticky=tk.W, pady=6, padx=(0, 12))
-        self.start_date_entry = ttk.Entry(self.date_frame, textvariable=self.start_date, style="Modern.TEntry")
-        self.start_date_entry.grid(row=0, column=1, sticky=tk.EW)
+        self.start_date_entry = ttk.Entry(self.date_frame, textvariable=self.start_date, style=f"{self.theme_name}.Modern.TEntry")
+        self.start_date_entry.grid(row=0, column=1, sticky=tk.EW, pady=4)
         self._make_button(self.date_frame, "Calendar", lambda: self.open_date_picker(self.start_date),
                           kind="secondary").grid(row=0, column=2, padx=(8, 0))
         self._label(self.date_frame, "End Date (YYYY-MM-DD)").grid(row=1, column=0, sticky=tk.W, pady=6, padx=(0, 12))
-        self.end_date_entry = ttk.Entry(self.date_frame, textvariable=self.end_date, style="Modern.TEntry")
-        self.end_date_entry.grid(row=1, column=1, sticky=tk.EW)
+        self.end_date_entry = ttk.Entry(self.date_frame, textvariable=self.end_date, style=f"{self.theme_name}.Modern.TEntry")
+        self.end_date_entry.grid(row=1, column=1, sticky=tk.EW, pady=4)
         self._make_button(self.date_frame, "Calendar", lambda: self.open_date_picker(self.end_date),
                           kind="secondary").grid(row=1, column=2, padx=(8, 0))
         self.date_hint = tk.Label(self.date_frame, text="", font=(self.ui_font, 8), anchor=tk.W)
         self.date_hint.grid(row=2, column=1, sticky=tk.W)
         self._track(self.date_hint, lambda w, C: w.config(bg=C["CARD"]))
         self._label(self.date_frame, "Branch").grid(row=3, column=0, sticky=tk.W, pady=6, padx=(0, 12))
-        self.branch_entry = ttk.Combobox(self.date_frame, textvariable=self.branch, style="Modern.TCombobox")
-        self.branch_entry.grid(row=3, column=1, sticky=tk.EW)
+        self.branch_entry = ttk.Combobox(self.date_frame, textvariable=self.branch, style=f"{self.theme_name}.Modern.TCombobox")
+        self.branch_entry.grid(row=3, column=1, sticky=tk.EW, pady=4)
         self._label(self.date_frame, "Author (optional)").grid(row=4, column=0, sticky=tk.W, pady=6, padx=(0, 12))
-        self.author_entry = ttk.Entry(self.date_frame, textvariable=self.author, style="Modern.TEntry")
-        self.author_entry.grid(row=4, column=1, sticky=tk.EW)
+        self.author_entry = ttk.Entry(self.date_frame, textvariable=self.author, style=f"{self.theme_name}.Modern.TEntry")
+        self.author_entry.grid(row=4, column=1, sticky=tk.EW, pady=4)
         preset_row = tk.Frame(self.date_frame)
         preset_row.grid(row=5, column=1, columnspan=2, sticky=tk.W, pady=(5, 0))
         self._track(preset_row, lambda w, C: w.config(bg=C["CARD"]))
@@ -523,24 +597,32 @@ class App(tk.Tk):
         self.sha_range_frame = tk.Frame(self.params_inner)
         self._track(self.sha_range_frame, lambda w, C: w.config(bg=C["CARD"]))
         self.sha_range_frame.columnconfigure(1, weight=1)
-        self._label(self.sha_range_frame, "Start SHA (included)").grid(row=0, column=0, sticky=tk.W, pady=6, padx=(0, 12))
-        self.start_sha_entry = ttk.Entry(self.sha_range_frame, textvariable=self.start_sha, style="Modern.TEntry")
-        self.start_sha_entry.grid(row=0, column=1, sticky=tk.EW)
+        self._label(self.sha_range_frame, "Start SHA").grid(row=0, column=0, sticky=tk.W, pady=6, padx=(0, 12))
+        self.start_sha_entry = ttk.Entry(self.sha_range_frame, textvariable=self.start_sha, style=f"{self.theme_name}.Modern.TEntry")
+        self.start_sha_entry.grid(row=0, column=1, sticky=tk.EW, pady=4)
         self._make_button(self.sha_range_frame, "Pick…", lambda: self.open_commit_picker(self.start_sha),
                           kind="secondary").grid(row=0, column=2, padx=(8, 0))
         self._label(self.sha_range_frame, "End SHA (included)").grid(row=1, column=0, sticky=tk.W, pady=6, padx=(0, 12))
-        self.end_sha_entry = ttk.Entry(self.sha_range_frame, textvariable=self.end_sha, style="Modern.TEntry")
-        self.end_sha_entry.grid(row=1, column=1, sticky=tk.EW)
+        self.end_sha_entry = ttk.Entry(self.sha_range_frame, textvariable=self.end_sha, style=f"{self.theme_name}.Modern.TEntry")
+        self.end_sha_entry.grid(row=1, column=1, sticky=tk.EW, pady=4)
         self._make_button(self.sha_range_frame, "Pick…", lambda: self.open_commit_picker(self.end_sha),
                           kind="secondary").grid(row=1, column=2, padx=(8, 0))
+
+        for row, variable in enumerate((self.start_sha, self.end_sha)):
+            self._make_button(self.sha_range_frame, "Copy SHA", lambda v=variable: self.copy_sha(v.get()),
+                              kind="secondary").grid(row=row, column=3, padx=(8, 0))
+        ttk.Checkbutton(self.sha_range_frame, text="Exclude start commit (C → F includes D, E, F)",
+                        variable=self.exclude_start, style="Modern.TCheckbutton",
+                        command=lambda: setattr(self, "selected_files", None)).grid(
+                            row=2, column=1, columnspan=3, sticky=tk.W, pady=(10, 0))
 
         # Single commit mode
         self.commit_sha_frame = tk.Frame(self.params_inner)
         self._track(self.commit_sha_frame, lambda w, C: w.config(bg=C["CARD"]))
         self.commit_sha_frame.columnconfigure(1, weight=1)
         self._label(self.commit_sha_frame, "Commit SHA").grid(row=0, column=0, sticky=tk.W, pady=6, padx=(0, 12))
-        self.commit_sha_entry = ttk.Entry(self.commit_sha_frame, textvariable=self.commit_sha, style="Modern.TEntry")
-        self.commit_sha_entry.grid(row=0, column=1, sticky=tk.EW)
+        self.commit_sha_entry = ttk.Entry(self.commit_sha_frame, textvariable=self.commit_sha, style=f"{self.theme_name}.Modern.TEntry")
+        self.commit_sha_entry.grid(row=0, column=1, sticky=tk.EW, pady=4)
         self._make_button(self.commit_sha_frame, "Pick…", lambda: self.open_commit_picker(self.commit_sha),
                           kind="secondary").grid(row=0, column=2, padx=(8, 0))
 
@@ -549,12 +631,12 @@ class App(tk.Tk):
         self.tag_range_frame.columnconfigure(1, weight=1)
         self._label(self.tag_range_frame, "Start Tag").grid(row=0, column=0, sticky=tk.W, pady=6, padx=(0, 12))
         self.start_tag_combo = ttk.Combobox(self.tag_range_frame, textvariable=self.start_tag,
-                                            state="readonly", style="Modern.TCombobox")
-        self.start_tag_combo.grid(row=0, column=1, sticky=tk.EW)
+                                            state="readonly", style=f"{self.theme_name}.Modern.TCombobox")
+        self.start_tag_combo.grid(row=0, column=1, sticky=tk.EW, pady=4)
         self._label(self.tag_range_frame, "End Tag").grid(row=1, column=0, sticky=tk.W, pady=6, padx=(0, 12))
         self.end_tag_combo = ttk.Combobox(self.tag_range_frame, textvariable=self.end_tag,
-                                          state="readonly", style="Modern.TCombobox")
-        self.end_tag_combo.grid(row=1, column=1, sticky=tk.EW)
+                                          state="readonly", style=f"{self.theme_name}.Modern.TCombobox")
+        self.end_tag_combo.grid(row=1, column=1, sticky=tk.EW, pady=4)
 
     def _build_progress(self, parent):
         wrapper = tk.Frame(parent)
@@ -607,7 +689,7 @@ class App(tk.Tk):
     # Validation
     # ------------------------------------------------------------------
     def _is_git_repo(self, path):
-        return bool(path) and os.path.isdir(path) and os.path.exists(os.path.join(path, '.git'))
+        return is_git_repository(path)
 
     def _valid_date(self, text):
         if not text:
@@ -648,6 +730,8 @@ class App(tk.Tk):
     def _refresh_recent_repos(self):
         seen, recents = set(), []
         for entry in self.history_manager.get_history():
+            if entry.get("parameters", {}).get("remote_url"):
+                continue
             rp = entry.get("repo_path", "")
             if rp and rp not in seen and os.path.isdir(rp):
                 seen.add(rp)
@@ -667,13 +751,128 @@ class App(tk.Tk):
             pass
         screen_width = self.winfo_screenwidth()
         screen_height = self.winfo_screenheight()
+        width = min(width, screen_width - 80)
+        height = min(height, screen_height - 100)
         x = (screen_width - width) // 2
         y = (screen_height - height) // 2 - 40
         if y < 0:
             y = 10
         self.geometry(f"{width}x{height}+{x}+{y}")
 
+    def invalidate_remote(self):
+        if hasattr(self, 'remote_connected_url') and self.source_mode.get() == 'HTTPS URL':
+            self.remote_connected_url = ''
+            self.repo_path.set('')
+            self.selected_files = None
+
+    def change_source(self, event=None):
+        self.selected_files = None
+        self.repo_path.set('')
+        self.remote_connected_url = ''
+        self.repo_status.config(text='Connect an HTTPS repository' if self.source_mode.get() == 'HTTPS URL' else 'Select a local Git folder')
+        if self.source_mode.get() == 'HTTPS URL':
+            self.local_panel.grid_remove()
+            self.remote_panel.grid(row=1, column=0, columnspan=5, sticky=tk.EW, pady=(8, 0))
+        else:
+            self.remote_panel.grid_remove()
+            self.local_panel.grid()
+
+    def connect_remote(self):
+        if self.remote_busy:
+            return
+        try:
+            url = normalize_url(self.remote_url.get())
+        except ValueError as exc:
+            messagebox.showerror('Repository URL', str(exc))
+            return
+        win = tk.Toplevel(self)
+        win.title('Connect to HTTPS repository')
+        win.configure(bg=self.C['CARD'])
+        win.transient(self)
+        win.grab_set()
+        method = tk.StringVar(value='Personal access token')
+        username = tk.StringVar()
+        token = tk.StringVar()
+        self._label(win, 'Authentication').pack(anchor=tk.W, padx=16, pady=(16, 4))
+        ttk.Combobox(win, textvariable=method, state='readonly', width=30,
+                     values=('Personal access token', 'Web login (Git Credential Manager)', 'Existing credentials / Public'),
+                     style=f'{self.theme_name}.Modern.TCombobox').pack(fill=tk.X, padx=16)
+        token_fields = tk.Frame(win, bg=self.C['CARD'])
+        self._label(token_fields, 'Username').pack(anchor=tk.W, pady=(10, 4))
+        ttk.Entry(token_fields, textvariable=username, style=f'{self.theme_name}.Modern.TEntry').pack(fill=tk.X)
+        self._label(token_fields, 'Personal access token (not your password)').pack(anchor=tk.W, pady=(10, 4))
+        ttk.Entry(token_fields, textvariable=token, show='•', style=f'{self.theme_name}.Modern.TEntry').pack(fill=tk.X)
+        hint = self._label(win, '', muted=True)
+        hint.configure(wraplength=480, justify=tk.LEFT, anchor=tk.W)
+        hint.pack(fill=tk.X, padx=16, pady=12)
+        def update_authentication(*args):
+            if method.get() == 'Personal access token':
+                token_fields.pack(fill=tk.X, padx=16, before=hint)
+                hint.configure(text='Enter your username and token. With 2FA, use a token instead of your account password.\nGitHub: Contents read. GitLab: read_repository.')
+                help_button.configure(text='Token help')
+                help_button.pack(padx=16, pady=(0, 12), before=actions)
+            else:
+                token_fields.pack_forget()
+                token.set('')
+                if method.get() == 'Existing credentials / Public':
+                    hint.configure(text='No fields to fill in. Click Connect to use credentials already stored in Git or access a public repository.')
+                    help_button.pack_forget()
+                else:
+                    hint.configure(text='No username or token needed here. Click Connect to start web login through Git Credential Manager. Company servers may require OAuth setup.')
+                    help_button.configure(text='Web login help')
+                    help_button.pack(padx=16, pady=(0, 12), before=actions)
+            win.update_idletasks()
+            win.geometry('')
+        def submit():
+            auth = {'Personal access token': 'token', 'Web login (Git Credential Manager)': 'browser',
+                    'Existing credentials / Public': 'auto'}[method.get()]
+            user, secret = (username.get(), token.get()) if auth == 'token' else ('', '')
+            if auth == 'token' and (not user.strip() or not secret.strip()):
+                messagebox.showwarning('Authentication', 'Enter a username and personal access token.', parent=win)
+                return
+            token.set('')
+            self.remote_url.set(url)
+            win.destroy()
+            self.remote_busy = True
+            self._set_button_state(self.remote_connect_button, 'disabled')
+            self.repo_path.set('')
+            self.remote_connected_url = ''
+            self.repo_status.config(text='Connecting / downloading Git history…')
+            def load():
+                try:
+                    path = prepare_repository(url, auth, user, secret)
+                    self.ui_queue.put(lambda: self.finish_remote(url, path, None))
+                except Exception as exc:
+                    error = str(exc)
+                    self.ui_queue.put(lambda: self.finish_remote(url, None, error))
+            threading.Thread(target=load, daemon=True).start()
+        help_button = self._make_button(win, 'Token help', lambda: webbrowser.open(
+            'https://github.com/git-ecosystem/git-credential-manager/blob/main/docs/README.md'), kind='secondary')
+        actions = tk.Frame(win, bg=self.C['CARD'])
+        actions.pack(fill=tk.X, padx=16, pady=(0, 16))
+        self._make_button(actions, 'Connect', submit).pack(side=tk.RIGHT)
+        self._make_button(actions, 'Cancel', win.destroy, kind='secondary').pack(side=tk.LEFT)
+        method.trace_add('write', update_authentication)
+        update_authentication()
+
+    def finish_remote(self, url, path, error):
+        self.remote_busy = False
+        self._set_button_state(self.remote_connect_button, 'normal')
+        if error:
+            self.repo_status.config(text='Connection failed')
+            messagebox.showerror('HTTPS repository', error)
+            return
+        if self.source_mode.get() != 'HTTPS URL' or self.remote_url.get().strip().rstrip('/') != url:
+            return
+        self.remote_connected_url = url
+        self.repo_path.set(path)
+        self.refresh_repository()
+        self.log('Remote repository ready. Branches, dates, SHA and tags can now be selected.')
+
     def browse_repo(self):
+        if self.source_mode.get() == 'HTTPS URL':
+            self.connect_remote()
+            return
         path = filedialog.askdirectory(title="Select Git Repository Folder")
         if path:
             self.repo_path.set(path)
@@ -688,7 +887,7 @@ class App(tk.Tk):
         self.repo_status.config(text="Reading repository status...")
         def load():
             info = get_repository_info(repo)
-            self.after(0, lambda: self._show_repository_info(info))
+            self.ui_queue.put(lambda: self._show_repository_info(info) if self.repo_path.get().strip() == repo else None)
         threading.Thread(target=load, daemon=True).start()
 
     def _show_repository_info(self, info):
@@ -710,6 +909,9 @@ class App(tk.Tk):
             if not self.start_tag.get() and len(info['tags']) > 1: self.start_tag.set(info['tags'][1])
 
     def start_git_fetch(self):
+        if self.source_mode.get() == 'HTTPS URL':
+            self.connect_remote()
+            return
         repo = self.repo_path.get().strip()
         if not self._is_git_repo(repo):
             messagebox.showerror("Invalid repository", "Please select a valid Git repository first.")
@@ -721,10 +923,10 @@ class App(tk.Tk):
                 result = subprocess.run(['git', 'fetch', '--prune'], cwd=repo, capture_output=True,
                                         text=True, encoding='utf-8', errors='replace')
                 message = (result.stdout + result.stderr).strip() or "Fetch complete."
-                self.after(0, lambda: self._finish_git_fetch(result.returncode == 0, message))
+                self.ui_queue.put(lambda: self._finish_git_fetch(result.returncode == 0, message))
             except Exception as exc:
                 message = str(exc)
-                self.after(0, lambda: self._finish_git_fetch(False, message))
+                self.ui_queue.put(lambda: self._finish_git_fetch(False, message))
         threading.Thread(target=fetch, daemon=True).start()
 
     def _finish_git_fetch(self, success, message):
@@ -777,6 +979,9 @@ class App(tk.Tk):
 
     def start_git_pull(self):
         """Safely update the selected repository without blocking the UI."""
+        if self.source_mode.get() == 'HTTPS URL':
+            self.connect_remote()
+            return
         repo_path = self.repo_path.get().strip()
         if not self._is_git_repo(repo_path):
             messagebox.showerror(
@@ -838,12 +1043,12 @@ class App(tk.Tk):
                 part.strip() for part in (result.stdout, result.stderr) if part.strip()
             )
             success = result.returncode == 0
-            self.after(0, lambda: self._finish_git_pull(success, output or "Git Pull completed."))
+            self.ui_queue.put(lambda: self._finish_git_pull(success, output or "Git Pull completed."))
         except FileNotFoundError:
-            self.after(0, lambda: self._finish_git_pull(False, "Git is not installed or is not available in PATH."))
+            self.ui_queue.put(lambda: self._finish_git_pull(False, "Git is not installed or is not available in PATH."))
         except Exception as exc:
             message = str(exc)
-            self.after(0, lambda: self._finish_git_pull(False, message))
+            self.ui_queue.put(lambda: self._finish_git_pull(False, message))
 
     def _finish_git_pull(self, success, message):
         self._set_button_state(self.git_pull_button, "normal")
@@ -851,10 +1056,52 @@ class App(tk.Tk):
         self.log(message)
         self.git_pull_thread = None
         self.refresh_repository()
-        if success:
-            messagebox.showinfo("Git Pull", message)
-        else:
-            messagebox.showerror("Git Pull failed", message)
+        self.show_git_output("Git Pull" if success else "Git Pull failed", message)
+
+    def show_git_output(self, title, message):
+        win = tk.Toplevel(self)
+        win.title(title)
+        win.configure(bg=self.C["BG"])
+        win.transient(self)
+        width = min(720, self.winfo_screenwidth() - 80)
+        height = min(480, self.winfo_screenheight() - 120)
+        win.geometry(f"{width}x{height}")
+        win.minsize(min(420, width), min(260, height))
+        # Reserve footer space before packing the expanding log.
+        footer = tk.Frame(win, bg=self.C["BG"])
+        footer.pack(side=tk.BOTTOM, fill=tk.X, padx=16, pady=12)
+        ok = self._make_button(footer, "OK", win.destroy)
+        ok.pack(side=tk.RIGHT)
+        output = scrolledtext.ScrolledText(win, wrap=tk.WORD, font=(MONO_FONT, 10),
+                                          bg=self.C["INPUT_BG"], fg=self.C["TEXT"],
+                                          relief="flat", padx=12, pady=12)
+        output.pack(fill=tk.BOTH, expand=True, padx=16, pady=(16, 0))
+        output.insert("1.0", message)
+        output.configure(state="disabled")
+        win.bind("<Escape>", lambda e: win.destroy())
+        win.bind("<Return>", lambda e: win.destroy())
+        win.grab_set()
+        ok.focus_set()
+
+    def copy_sha(self, value):
+        value = value.strip()
+        if not value:
+            self.log("Select or enter a SHA first.")
+            return
+        if len(value) < 8 or any(c not in "0123456789abcdefABCDEF" for c in value):
+            try:
+                result = subprocess.run(["git", "rev-parse", "--verify", f"{value}^{{commit}}"],
+                                        cwd=self.repo_path.get(), capture_output=True, text=True)
+                if result.returncode:
+                    self.log("Could not resolve SHA to a commit.")
+                    return
+                value = result.stdout.strip()
+            except OSError as exc:
+                self.log(f"Could not copy SHA: {exc}")
+                return
+        self.clipboard_clear()
+        self.clipboard_append(value[:8])
+        self.log(f"Copied SHA: {value[:8]}")
 
     def on_format_change(self, event=None):
         current_path = self.output_path.get()
@@ -922,6 +1169,19 @@ class App(tk.Tk):
             pass
         self.after(100, self.process_progress_queue)
 
+    def process_completion_queue(self):
+        try:
+            while True:
+                self.ui_queue.get_nowait()()
+        except queue.Empty:
+            pass
+        try:
+            while True:
+                self._handle_complete(self.completion_queue.get_nowait())
+        except queue.Empty:
+            pass
+        self.after(100, self.process_completion_queue)
+
     def update_progress(self, value, message):
         self.progress_queue.put((value, message))
 
@@ -932,11 +1192,17 @@ class App(tk.Tk):
     # Completion handling (messageboxes + open folder)
     # ------------------------------------------------------------------
     def _on_complete(self, result):
-        # Called from worker thread; marshal to UI thread
-        self.after(0, lambda: self._handle_complete(result))
+        # The UI queue avoids calling Tk from the archive worker.
+        self.completion_queue.put(result)
 
     def _handle_complete(self, result):
         if result.get('success'):
+            try:
+                self.save_to_history(result.get('request'), result.get('archive_path'))
+                self._refresh_recent_repos()
+            except OSError as exc:
+                self.log(f'History could not be saved: {exc}')
+                messagebox.showwarning('History not saved', f'Archive created, but history could not be saved:\n{exc}')
             self._last_archive_path = result.get('archive_path', '')
             archive = result.get('archive_path', '')
             count = result.get('file_count', 0)
@@ -1025,6 +1291,7 @@ class App(tk.Tk):
             'branch': self.branch.get(),
             'author': self.author.get(),
             'start_sha': self.start_sha.get(),
+            'exclude_start': self.exclude_start.get(),
             'end_sha': self.end_sha.get(),
             'commit_sha': self.commit_sha.get(),
             'start_tag': self.start_tag.get(),
@@ -1033,6 +1300,13 @@ class App(tk.Tk):
             'selected_files': self.selected_files
         }
 
+        request = {key: value for key, value in params.items()
+                   if key not in ('log_callback', 'progress_callback', 'complete_callback', 'cancel_event')}
+        request['exclude_patterns'] = self.exclude_patterns.get()
+        request['remote_url'] = self.remote_connected_url if self.source_mode.get() == 'HTTPS URL' else ''
+        def completed(result):
+            self._on_complete(dict(result, request=request))
+        params['complete_callback'] = completed
         self.archive_thread = threading.Thread(target=archive_git_history, args=(params,))
         self.archive_thread.daemon = True
         self.archive_thread.start()
@@ -1063,32 +1337,21 @@ class App(tk.Tk):
                 if self.progress_bar['value'] < 100:
                     self.progress_bar['value'] = 0
                     self.progress_var.set("Ready")
-                if self.progress_bar['value'] == 100:
-                    self.save_to_history()
-                    self._refresh_recent_repos()
             self.cancel_event = None
             self.archive_thread = None
 
-    def save_to_history(self):
-        params = {
-            'start_date': self.start_date.get(),
-            'end_date': self.end_date.get(),
-            'branch': self.branch.get(),
-            'author': self.author.get(),
-            'start_sha': self.start_sha.get(),
-            'end_sha': self.end_sha.get(),
-            'commit_sha': self.commit_sha.get(),
-            'start_tag': self.start_tag.get(),
-            'end_tag': self.end_tag.get(),
-            'exclude_patterns': self.exclude_patterns.get()
-        }
+    def save_to_history(self, request, archive_path):
+        if not request:
+            raise OSError("Archive request is missing; history was not saved.")
+        parameters = {key: request.get(key, '') for key in (
+            'start_date', 'end_date', 'branch', 'author', 'start_sha', 'end_sha',
+            'commit_sha', 'start_tag', 'end_tag', 'exclude_patterns', 'changelog_format')}
+        parameters['exclude_start'] = request.get('exclude_start', False)
+        parameters['remote_url'] = request.get('remote_url', '')
         self.history_manager.add_entry(
-            repo_path=self.repo_path.get(),
-            output_path=self.output_path.get(),
-            mode=self.mode.get(),
-            parameters=params,
-            archive_format=self.archive_format.get()
-        )
+            repo_path=request['repo_path'], output_path=archive_path or request['output_zip'],
+            mode=request['mode'], parameters=parameters,
+            archive_format=request.get('archive_format', 'zip'))
 
     def preview_files(self):
         if not self.repo_path.get():
@@ -1103,6 +1366,7 @@ class App(tk.Tk):
             'branch': self.branch.get(),
             'author': self.author.get(),
             'start_sha': self.start_sha.get(),
+            'exclude_start': self.exclude_start.get(),
             'end_sha': self.end_sha.get(),
             'commit_sha': self.commit_sha.get(),
             'start_tag': self.start_tag.get(),
@@ -1125,7 +1389,7 @@ class App(tk.Tk):
 
         def run_preview():
             result = get_file_list_preview(params)
-            self.after(0, lambda: self.show_preview_window(result))
+            self.ui_queue.put(lambda: self.show_preview_window(result))
 
         thread = threading.Thread(target=run_preview)
         thread.daemon = True
@@ -1157,7 +1421,7 @@ class App(tk.Tk):
         search_var = tk.StringVar()
         search_row = tk.Frame(win, bg=C["BG"]); search_row.pack(fill=tk.X, padx=16)
         tk.Label(search_row, text="Filter:", bg=C["BG"], fg=C["TEXT_MUTED"]).pack(side=tk.LEFT)
-        ttk.Entry(search_row, textvariable=search_var, style="Modern.TEntry").pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(6, 0))
+        ttk.Entry(search_row, textvariable=search_var, style=f"{self.theme_name}.Modern.TEntry").pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(6, 0))
 
         list_frame = tk.Frame(win, bg=C["CARD"], highlightbackground=C["BORDER"], highlightthickness=1)
         list_frame.pack(fill=tk.BOTH, expand=True, padx=16, pady=8)
@@ -1234,7 +1498,7 @@ class App(tk.Tk):
                  font=(self.ui_font, 13, "bold")).pack(side=tk.LEFT)
 
         search_var = tk.StringVar()
-        search_entry = ttk.Entry(header, textvariable=search_var, style="Modern.TEntry", width=28)
+        search_entry = ttk.Entry(header, textvariable=search_var, style=f"{self.theme_name}.Modern.TEntry", width=28)
         search_entry.pack(side=tk.RIGHT)
         tk.Label(header, text="Filter:", bg=C["BG"], fg=C["TEXT_MUTED"],
                  font=(self.ui_font, 9)).pack(side=tk.RIGHT, padx=(0, 6))
@@ -1269,7 +1533,7 @@ class App(tk.Tk):
                 if term and term not in hay:
                     continue
                 tree.insert("", tk.END, iid=c['hash'],
-                            values=(c['short_hash'], c['date'], c['author'], c['message']))
+                            values=(c['hash'][:8], c['date'], c['author'], c['message']))
                 shown += 1
             status.config(text=f"{shown} commit(s) shown")
 
@@ -1279,7 +1543,7 @@ class App(tk.Tk):
             if data.get('error'):
                 # fallback: try without branch
                 data = get_recent_commits(repo, limit=200)
-            self.after(0, lambda: finish_load(data))
+            self.ui_queue.put(lambda: finish_load(data))
 
         def finish_load(data):
             nonlocal all_commits
@@ -1302,6 +1566,8 @@ class App(tk.Tk):
         btn_row = tk.Frame(win, bg=C["BG"])
         btn_row.pack(fill=tk.X, padx=16, pady=12)
         self._make_button(btn_row, "Use Selected", choose, kind="primary").pack(side=tk.LEFT)
+        self._make_button(btn_row, "Copy SHA", lambda: self.copy_sha(tree.selection()[0]) if tree.selection() else None,
+                          kind="secondary").pack(side=tk.LEFT, padx=8)
         self._make_button(btn_row, "Close", win.destroy, kind="secondary").pack(side=tk.RIGHT)
 
         threading.Thread(target=load, daemon=True).start()
@@ -1346,7 +1612,7 @@ class App(tk.Tk):
             except Exception:
                 pass
             mode = entry.get('mode', 'unknown')
-            repo = os.path.basename(entry.get('repo_path', '')) if entry.get('repo_path') else entry.get('repo_path', '')
+            repo = entry.get('parameters', {}).get('remote_url') or os.path.basename(entry.get('repo_path', ''))
             output = os.path.basename(entry.get('output_path', '')) if entry.get('output_path') else entry.get('output_path', '')
             entry_str = str(id(entry))
             history_tree.insert("", tk.END, values=(timestamp, mode, repo, output), tags=(entry_str,))
@@ -1369,7 +1635,11 @@ class App(tk.Tk):
 
         def clear_history():
             if messagebox.askyesno("Clear history", "Delete all saved history entries?"):
-                self.history_manager.clear_history()
+                try:
+                    self.history_manager.clear_history()
+                except OSError as exc:
+                    messagebox.showerror("History", f"Could not clear saved history: {exc}")
+                    return
                 win.destroy()
                 self._refresh_recent_repos()
                 self.show_history()
@@ -1379,7 +1649,17 @@ class App(tk.Tk):
         self._make_button(button_frame, "Close", win.destroy, kind="secondary").pack(side=tk.RIGHT)
 
     def load_from_history(self, entry):
-        self.repo_path.set(entry.get('repo_path', ''))
+        remote = entry.get('parameters', {}).get('remote_url', '')
+        self.source_mode.set('HTTPS URL' if remote else 'Local folder')
+        self.change_source()
+        self.remote_url.set(remote)
+        if remote:
+            cached = entry.get('repo_path', '')
+            if self._is_git_repo(cached):
+                self.remote_connected_url = remote
+                self.repo_path.set(cached)
+        else:
+            self.repo_path.set(entry.get('repo_path', ''))
         self.output_path.set(entry.get('output_path', ''))
         self.mode.set(entry.get('mode', 'date'))
         self.archive_format.set(entry.get('archive_format', 'zip'))
@@ -1390,6 +1670,8 @@ class App(tk.Tk):
         self.branch.set(params.get('branch', 'main'))
         self.author.set(params.get('author', ''))
         self.start_sha.set(params.get('start_sha', ''))
+        self.exclude_start.set(params.get('exclude_start', False))
+        self.changelog_format.set(params.get('changelog_format', 'txt'))
         self.end_sha.set(params.get('end_sha', ''))
         self.commit_sha.set(params.get('commit_sha', ''))
         self.start_tag.set(params.get('start_tag', ''))

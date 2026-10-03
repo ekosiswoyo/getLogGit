@@ -44,3 +44,20 @@
 - Aplikasi akan berjalan sebagai windowed application (tanpa console)
 - Untuk menambahkan icon, edit `build.spec` dan tambahkan path ke file `.ico` di bagian `icon=None`
 
+
+## macOS
+
+Gunakan Python dengan dukungan Tk (misalnya Homebrew Python + python-tk versi yang sama).
+Buat virtual environment lalu jalankan build:
+
+```bash
+/opt/homebrew/bin/python3.13 -m venv .venv
+.venv/bin/python -m pip install -r requirements.txt
+./build.sh
+```
+
+Hasil: `dist/GitArchiveGenerator.app`. Build macOS menggunakan bundle onedir,
+icon `.icns`, dan arsitektur Python yang dipakai. Buka aplikasi melalui Finder.
+History dan pengaturan tersimpan di `~/Library/Application Support/GitArchiveGenerator`,
+sehingga tetap tersedia saat aplikasi dijalankan dari folder berbeda atau dibuild ulang.
+History lama di working directory/folder source dimigrasikan jika lokasi baru belum memiliki history.

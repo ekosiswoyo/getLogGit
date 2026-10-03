@@ -44,6 +44,9 @@ jobs:
           python -m pip install --upgrade pip
           pip install pyinstaller Pillow
 
+      - name: Test archive, history, and HTTPS authentication
+        run: python -m unittest discover -s tests -v
+
       - name: Generate Windows icon
         if: runner.os == 'Windows'
         run: python convert_icon.py
@@ -86,4 +89,5 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: dist/${{ matrix.asset_name }}
-          generate_release_notes: true
+          body_path: RELEASE_NOTES.md
+          generate_release_notes: false

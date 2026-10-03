@@ -26,7 +26,7 @@ if exist logo.png (
 
 echo.
 echo Creating executable...
-python -m PyInstaller build.spec
+python -m PyInstaller --noconfirm --onefile --windowed --name GitArchiveGenerator --icon logo.ico --add-data "logo.png;." git_archive_ui.py
 
 if errorlevel 1 (
     echo.

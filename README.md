@@ -18,7 +18,10 @@ This tool creates a `.zip` file containing the specified files and a `.txt` chan
   - **Single Commit:** Archive only the files that were modified in one specific commit.
   - **Tag Range:** Build a release package from the changes between two Git tags.
 
-Date ranges and SHA ranges are inclusive: enter the actual first and last date/commit you want to package. You do not need to select the previous date or parent commit.
+Date ranges and SHA ranges are inclusive by default: enter the actual first and last date/commit you want to package. In SHA Range mode, check **Exclude start commit** to package C → F as D, E, F. This option applies to preview, archive contents, and changelog and is saved in history. The CLI equivalent is `--exclude-start`.
+
+Use **Copy SHA** next to either SHA range field or in the commit picker to copy an 8-character SHA. On macOS, the interface uses themed controls and system fonts in both themes. Git Pull output opens in a scrollable dialog with a fixed OK button.
+- **Persistent History:** Successful archive requests are saved in the user data directory (on macOS: `~/Library/Application Support/GitArchiveGenerator/history.json`), independent of the launch folder. Legacy history is migrated when available.
 - **Repository Dashboard:** See the active branch, remote, latest commit, working-tree state, and ahead/behind counts.
 - **Safe Remote Updates:** Fetch with pruning or pull using fast-forward-only mode.
 - **Interactive Preview:** Review Added, Modified, Deleted, Renamed, and Copied files and choose which changes to include.
@@ -120,3 +123,27 @@ To create the executable file yourself:
 ## Author
 
 Created by **ekosiswoyo**
+
+## Repository from HTTPS URL
+
+Choose **Source → HTTPS URL**, paste the HTTPS clone URL, and click **Connect / Update**.
+The app downloads Git objects into a bare cache automatically; no manual clone or working tree is needed.
+Date range, SHA range (including exclude start), single commit, tags, preview, copy SHA, archives,
+and history use the same Git logic as local repositories. Fetch/Pull in URL mode refresh the cache.
+History remembers the URL and selection; tokens are never saved in history or Git config.
+
+Authentication options:
+
+- **Personal access token**: works on a fresh laptop with Git installed, without an existing credential helper.
+  Enter your username and PAT. For GitHub choose the repository and Contents read permission;
+  for GitLab choose `read_repository`. With 2FA, use a PAT instead of your password.
+  Organization SSO/administrator approval may also be required.
+- **Web login (Git Credential Manager)**: requires [GCM](https://github.com/git-ecosystem/git-credential-manager/releases).
+  If unavailable, the dialog explains how to install it or use a PAT. GCM handles browser login/2FA
+  and credential storage. Self-hosted GitLab/enterprise servers may require server-side OAuth setup.
+- **Existing credentials / Public**: uses installed Git credential helpers, or accesses public repositories anonymously.
+
+PATs are passed only to the Git child process, not command arguments, saved URLs, logs, or config files.
+PAT authentication does not save credentials; enter the token again when updating the cache.
+HTTPS certificate verification remains enabled. Company repositories require network/VPN access and
+trusted company certificates, as with ordinary Git. Git LFS/submodule content is not downloaded automatically.
